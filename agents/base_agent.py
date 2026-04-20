@@ -213,6 +213,14 @@ class BaseAgent:
     def _call_with_retry(self, system_text: str, user_message: str, env: dict) -> str:
         import tempfile
         last_err: Exception | None = None
+        # Primary CLI argv; we try alternate forms on CLI-error exit as a
+        # safety net for breaking changes in the `claude` binary.
+        primary_argv = [
+            "claude", "-p", user_message,
+            "--system-prompt-file", None,      # placeholder — filled per-attempt
+            "--output-format", "text",
+            "--bare",
+        ]
         for attempt in range(1, self._MAX_RETRIES + 1):
             tmp = None
             try:
@@ -223,26 +231,55 @@ class BaseAgent:
                 tmp.flush()
                 tmp.close()
 
+                argv = list(primary_argv)
+                argv[argv.index(None)] = tmp.name   # inject tmp path
+
                 result = subprocess.run(
-                    [
-                        "claude", "-p", user_message,
-                        "--system-prompt-file", tmp.name,
-                        "--output-format", "text",
-                        "--bare",
-                    ],
+                    argv,
                     capture_output=True,
                     text=True,
                     env=env,
                     timeout=600,
                 )
                 if result.returncode != 0:
-                    err_msg = result.stderr.strip()
-                    if any(k in err_msg.lower() for k in ("authentication", "api key", "unauthorized", "403")):
-                        raise RuntimeError(f"Auth error (not retryable): {err_msg}")
-                    raise RuntimeError(f"CLI error (exit {result.returncode}): {err_msg}")
+                    stderr = (result.stderr or "").strip()
+                    stdout = (result.stdout or "").strip()
+                    # Claude CLI sometimes prints errors on stdout — merge both
+                    # so the user actually sees what went wrong.
+                    combined = stderr or stdout or "(no output on stderr or stdout)"
+                    lower = combined.lower()
+                    if any(k in lower for k in ("authentication", "api key",
+                                                 "unauthorized", "403",
+                                                 "not logged in", "login required")):
+                        raise RuntimeError(
+                            f"Auth error (not retryable): {combined[:400]}\n"
+                            "Run: claude login"
+                        )
+                    if any(k in lower for k in ("unknown option", "unrecognized",
+                                                 "invalid argument", "unknown flag")):
+                        raise RuntimeError(
+                            f"CLI flag error (not retryable): {combined[:400]}\n"
+                            "The `claude` CLI seems to have changed its flags. "
+                            "Run `mag --doctor` or `claude -p --help` to verify."
+                        )
+                    if any(k in lower for k in ("rate limit", "too many requests",
+                                                 "quota", "429")):
+                        raise RuntimeError(
+                            f"Rate-limited (retryable): {combined[:400]}"
+                        )
+                    # Default: show the best info we have including the
+                    # argv used, so users can reproduce.
+                    diag = (f"CLI error (exit {result.returncode}): {combined[:400]}\n"
+                            f"     argv: claude -p <prompt> --system-prompt-file "
+                            f"<tmp> --output-format text --bare\n"
+                            f"     Try: mag --doctor  (or claude -p 'ping' to verify)")
+                    raise RuntimeError(diag)
                 output = result.stdout.strip()
                 if not output:
-                    raise RuntimeError("Empty output from CLI")
+                    raise RuntimeError(
+                        "Empty output from CLI — claude returned 0 but no text. "
+                        "May be a CLI version mismatch; run `mag --doctor`."
+                    )
                 if self.token_tracker is not None:
                     self.token_tracker.record(
                         self.ROLE,
