@@ -1,7 +1,7 @@
-"""Base agent using Claude Code CLI — no separate API key needed."""
+"""Base agent using Claude Code CLI. Auth is whatever `claude` is configured
+with locally — this module does not touch env vars or API keys."""
 from __future__ import annotations
 import subprocess
-import base64
 import os
 import threading
 import time
@@ -191,16 +191,10 @@ class BaseAgent:
     _RETRY_BASE_WAIT = 2  # seconds, doubles each attempt
 
     def _call(self, system: str, user_message: str, max_tokens: int = 4096) -> str:
-        import tempfile
+        """Call Claude Code CLI. Auth is handled by `claude` itself — we do
+        not read, strip, or forward ANTHROPIC_API_KEY. If your CLI works in a
+        terminal, it works here."""
         system_text = self._build_system(system)
-        env = {**os.environ}
-        # Env-var policy:
-        #   * Default: keep ANTHROPIC_API_KEY if set. Works for API-billed users.
-        #   * If MULTI_AGENT_STRIP_API_KEY=1 → always strip (force OAuth).
-        #   * _call_with_retry has a fallback: on 'Invalid API key' it strips
-        #     the key and retries once so Claude Code session can take over.
-        if os.environ.get("MULTI_AGENT_STRIP_API_KEY", "0") == "1":
-            env.pop("ANTHROPIC_API_KEY", None)
 
         # Rate-limit: acquire semaphore + enforce min spacing between call starts
         _CALL_SEMAPHORE.acquire()
@@ -212,11 +206,11 @@ class BaseAgent:
                     time.sleep(wait_ms / 1000)
                 _LAST_CALL_TIME[0] = time.monotonic() * 1000
 
-            return self._call_with_retry(system_text, user_message, env)
+            return self._call_with_retry(system_text, user_message)
         finally:
             _CALL_SEMAPHORE.release()
 
-    def _call_with_retry(self, system_text: str, user_message: str, env: dict) -> str:
+    def _call_with_retry(self, system_text: str, user_message: str) -> str:
         import tempfile
         last_err: Exception | None = None
         # Primary CLI argv; we try alternate forms on CLI-error exit as a
@@ -244,51 +238,26 @@ class BaseAgent:
                     argv,
                     capture_output=True,
                     text=True,
-                    env=env,
                     timeout=600,
                 )
                 if result.returncode != 0:
                     stderr = (result.stderr or "").strip()
                     stdout = (result.stdout or "").strip()
-                    # Claude CLI sometimes prints errors on stdout — merge both
-                    # so the user actually sees what went wrong.
                     combined = stderr or stdout or "(no output on stderr or stdout)"
                     lower = combined.lower()
-                    # Auto-recover from invalid API key: if one is set in env,
-                    # drop it and fall back to Claude Code session on retry.
-                    if ("invalid api key" in lower or "external api key" in lower) \
-                            and "ANTHROPIC_API_KEY" in env:
-                        print(f"  🔑 [{self.ROLE}] Invalid API key detected — "
-                              f"falling back to Claude Code session for this session.")
-                        env.pop("ANTHROPIC_API_KEY", None)
-                        # Don't count this as a retry attempt; try again immediately.
-                        continue
-                    if any(k in lower for k in ("authentication",
-                                                 "unauthorized", "403",
-                                                 "not logged in", "login required",
-                                                 "please run /login")):
-                        raise RuntimeError(
-                            f"Auth error (not retryable): {combined[:400]}"
-                        )
                     if any(k in lower for k in ("unknown option", "unrecognized",
                                                  "invalid argument", "unknown flag")):
                         raise RuntimeError(
                             f"CLI flag error (not retryable): {combined[:400]}\n"
                             "The `claude` CLI seems to have changed its flags. "
-                            "Run `mag --doctor` or `claude -p --help` to verify."
+                            "Run `mag --doctor` to verify."
                         )
                     if any(k in lower for k in ("rate limit", "too many requests",
                                                  "quota", "429")):
-                        raise RuntimeError(
-                            f"Rate-limited (retryable): {combined[:400]}"
-                        )
-                    # Default: show the best info we have including the
-                    # argv used, so users can reproduce.
-                    diag = (f"CLI error (exit {result.returncode}): {combined[:400]}\n"
-                            f"     argv: claude -p <prompt> --system-prompt-file "
-                            f"<tmp> --output-format text --bare\n"
-                            f"     Try: mag --doctor  (or claude -p 'ping' to verify)")
-                    raise RuntimeError(diag)
+                        raise RuntimeError(f"Rate-limited (retryable): {combined[:400]}")
+                    raise RuntimeError(
+                        f"CLI error (exit {result.returncode}): {combined[:400]}"
+                    )
                 output = result.stdout.strip()
                 if not output:
                     raise RuntimeError(
@@ -319,33 +288,40 @@ class BaseAgent:
         raise RuntimeError(f"[{self.ROLE}] CLI failed after {self._MAX_RETRIES} attempts: {last_err}")
 
     def _call_with_image(self, system: str, user_message: str, image_path: str, max_tokens: int = 2048) -> str:
-        """Vision call via Anthropic SDK — used for reviewing screenshots."""
-        try:
-            import anthropic
-        except ImportError:
-            raise RuntimeError("anthropic package not installed. Run: pip install anthropic")
+        """Vision call via the same Claude Code CLI — no separate SDK or auth.
 
+        Uses `claude -p <text> --image <path>`. Auth is whatever the CLI is
+        configured with locally.
+        """
+        import tempfile
         img = Path(image_path)
         if not img.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        media_type = "image/png" if img.suffix.lower() == ".png" else "image/jpeg"
-        image_data = base64.standard_b64encode(img.read_bytes()).decode("utf-8")
-
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=self._build_system(system),
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
-                    {"type": "text", "text": user_message},
-                ],
-            }],
-        )
-        return response.content[0].text.strip()
+        system_text = self._build_system(system)
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                               delete=False, encoding="utf-8")
+            tmp.write(system_text)
+            tmp.flush()
+            tmp.close()
+            result = subprocess.run(
+                ["claude", "-p", user_message,
+                 "--system-prompt-file", tmp.name,
+                 "--image", str(img),
+                 "--output-format", "text", "--bare"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip() or (result.stdout or "").strip()
+                raise RuntimeError(
+                    f"Vision CLI error (exit {result.returncode}): {err[:400]}"
+                )
+            return (result.stdout or "").strip()
+        finally:
+            if tmp:
+                Path(tmp.name).unlink(missing_ok=True)
 
     def ask(self, target: BaseAgent, question: str) -> str:
         """Send a question to another agent, get response, log in bus."""

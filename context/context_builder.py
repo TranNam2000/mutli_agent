@@ -11,7 +11,6 @@ Each agent has different information needs:
   QA       ← Dev: implemented modules + known limitations
 """
 from __future__ import annotations
-import os
 import re
 import subprocess
 import tempfile
@@ -46,8 +45,6 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
         "quyết định technical, constraint, risk. Bỏ phần giải thích thừa. "
         "Output dạng bullet points concise, đầy enough thông tin."
     )
-    env = {**os.environ}
-    env.pop("ANTHROPIC_API_KEY", None)
     tmp = None
     try:
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
@@ -57,7 +54,7 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
         result = subprocess.run(
             ["claude", "-p", text, "--system-prompt-file", tmp.name,
              "--output-format", "text", "--bare"],
-            capture_output=True, text=True, env=env, timeout=120,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
