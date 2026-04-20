@@ -207,6 +207,36 @@ def main():
         doctor_main()
         return
 
+    # ── feedback <session_id> --agent X --rating N --comment "..." ───────────
+    # Record a user feedback entry that RuleEvolver picks up on next session.
+    if len(sys.argv) >= 2 and sys.argv[1] == "feedback":
+        from learning.rule_evolver import FeedbackStore
+        session_id = sys.argv[2] if len(sys.argv) >= 3 else _get_arg("--session") or ""
+        agent      = _get_arg("--agent") or "general"
+        rating_raw = _get_arg("--rating") or "3"
+        comment    = _get_arg("--comment") or ""
+        profile    = _get_arg("--profile") or "default"
+        if not session_id:
+            print("❌ Usage: mag feedback <session_id> --agent <ba|dev|test|...> "
+                  "--rating <1-5> --comment \"...\" [--profile default]")
+            sys.exit(1)
+        try:
+            rating = int(rating_raw)
+        except ValueError:
+            print(f"❌ --rating must be 1-5 integer; got {rating_raw!r}")
+            sys.exit(1)
+        if rating < 1 or rating > 5:
+            print("❌ --rating must be between 1 and 5")
+            sys.exit(1)
+        store = FeedbackStore(RULES_DIR / profile)
+        path = store.record(session_id, agent, rating, comment)
+        print(f"✅ Feedback recorded → {path}")
+        print(f"   session={session_id}  agent={agent}  rating={rating}/5")
+        if comment:
+            print(f"   comment: {comment[:200]}")
+        print("   RuleEvolver will pick this up at the end of the next session.")
+        return
+
     # ── --trend (cross-session dashboard) ────────────────────────────────────
     if "--trend" in sys.argv:
         from reporting import build_trend_report

@@ -1763,6 +1763,99 @@ class ProductDevelopmentOrchestrator:
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
+    def _run_rule_evolver(self, raw_suggestions: list[dict], history):
+        """Product/enterprise rule evolution: provenance + multi-dim + A/B.
+
+        Opt-in via MULTI_AGENT_RULE_EVOLVER=1. Supersedes the legacy
+        auto-apply loop in _run_rule_optimizer by routing suggestions
+        through RuleEvolver (which merges with user feedback + cost
+        signals and can shadow rules for A/B testing).
+        """
+        from learning.rule_evolver import (
+            RuleEvolver, Suggestion, SRC_LLM, SRC_INTEGRITY,
+        )
+        from agents.base_agent import _RULES_DIR
+
+        profile_dir = _RULES_DIR / self.profile
+        evolver = RuleEvolver(profile_dir, session_id=self.session_id)
+
+        # Split incoming raw suggestions by source tag we embedded earlier.
+        llm_raw:      list[dict] = []
+        integrity_raw: list[dict] = []
+        for s in raw_suggestions:
+            if s.get("source") == "integrity":
+                integrity_raw.append(s)
+            else:
+                llm_raw.append(s)
+
+        merged = evolver.gather(
+            llm_suggestions=llm_raw,
+            integrity_suggestions=integrity_raw,
+        )
+        if not merged:
+            tprint("  RuleEvolver: no signals → skip this session.")
+        else:
+            # Load current rule content for consistency scoring.
+            current: dict[str, str] = {}
+            for s in merged:
+                path = self._rule_path_for(s.agent_key, s.target_type)
+                try:
+                    current[f"{s.agent_key}:{s.target_type}"] = path.read_text(encoding="utf-8") if path.exists() else ""
+                except Exception:
+                    current[f"{s.agent_key}:{s.target_type}"] = ""
+
+            decided = evolver.decide(merged, current)
+
+            # Filter suggestions that ReviseHistory blacklists / conflicts.
+            filtered = []
+            for s in decided:
+                if history.is_blacklisted(s.agent_key, s.reason, s.target_type):
+                    tprint(f"  🚫 [{s.agent_key.upper()}] Skip — blacklisted regression pattern.")
+                    continue
+                conflict = history.conflicts_with_pass_patterns(s.agent_key, s.addition)
+                if conflict:
+                    tprint(f"  🛡️  [{s.agent_key.upper()}] Skip — conflicts PASS pattern.")
+                    continue
+                filtered.append(s)
+
+            result = evolver.apply(filtered, self._rule_path_for)
+
+            tprint(f"\n  {'═'*60}")
+            tprint(f"  🧬 RULE EVOLVER")
+            tprint(f"  {'═'*60}")
+            tprint(f"  ✅ auto-applied : {len(result['applied'])}")
+            tprint(f"  🧪 shadowed A/B : {len(result['shadowed'])}")
+            tprint(f"  ⏳ pending     : {len(result['pending'])}")
+            for item in result["applied"][:5]:
+                src = "+".join(item["sources"])
+                tprint(f"     ✅ [{item['agent_key'].upper()}] "
+                       f"src={src} score={item['multi_dim']:.2f} — "
+                       f"{item['reason'][:70]}")
+            for item in result["shadowed"][:5]:
+                tprint(f"     🧪 [{item['agent_key'].upper()}] shadow — "
+                       f"{item['reason'][:70]}")
+
+        # Evaluate live shadows (promote/demote based on accumulated scores).
+        actions = evolver.evaluate_shadows(self._rule_path_for)
+        promoted = [a for a in actions if a["action"] == "promote"]
+        demoted  = [a for a in actions if a["action"] == "demote"]
+        if promoted or demoted:
+            tprint(f"\n  🔬 Shadow verdicts: "
+                   f"{len(promoted)} promoted, {len(demoted)} demoted")
+            for a in promoted:
+                tprint(f"     ⬆️  PROMOTE {a['key']} (+{a['delta']:.2f})")
+            for a in demoted:
+                tprint(f"     ⬇️  DEMOTE  {a['key']} ({a['delta']:.2f})")
+
+    def _rule_path_for(self, agent_key: str, target_type: str):
+        """Resolve rules/<profile>/<agent>.md vs rules/<profile>/criteria/<agent>.md."""
+        from agents.base_agent import _RULES_DIR
+        from pathlib import Path as _P
+        base = _RULES_DIR / self.profile
+        if target_type == "criteria":
+            return _P(base / "criteria" / f"{agent_key}.md")
+        return _P(base / f"{agent_key}.md")
+
     def _run_rule_optimizer(self):
         """After pipeline, auto-apply recurring improvements; ask user only for new patterns."""
         from learning.revise_history import ReviseHistory, AUTO_THRESHOLD
@@ -1840,6 +1933,14 @@ class ProductDevelopmentOrchestrator:
             tprint(f"\n  🧬 Integrity surface {len(integrity_suggestions)} "
                    f"deterministic rule suggestion(s) (no LLM cost)")
             suggestions = list(suggestions or []) + integrity_suggestions
+
+        # ── RuleEvolver (opt-in via MULTI_AGENT_RULE_EVOLVER=1) ─────────────
+        # Merges LLM + Integrity + User Feedback + Cost signals, scores each
+        # suggestion along 4 dimensions, routes to auto-apply / shadow A/B /
+        # pending lanes, and evaluates existing shadows for promote/demote.
+        if os.environ.get("MULTI_AGENT_RULE_EVOLVER", "0") == "1":
+            self._run_rule_evolver(suggestions, history)
+            return
 
         if not suggestions:
             tprint("  No tìm thấy pattern bug rõ ràng to cải tcurrent.")
