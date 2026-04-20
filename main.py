@@ -35,7 +35,8 @@ BANNER = """
 ╔══════════════════════════════════════════════════════════════════╗
 ║      🤖  MULTI-AGENT PRODUCT DEVELOPMENT PIPELINE  🤖           ║
 ║                                                                  ║
-║  Flow: BA(classify) → Design → TechLead → Dev ∥ Test            ║
+║  Flow: PM(route) → BA → Design → TechLead → Dev ∥ Test           ║
+║        kind = feature | bug_fix | ui_tweak | refactor | investig ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 

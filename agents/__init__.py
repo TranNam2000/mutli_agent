@@ -7,9 +7,10 @@ from .critic_agent import CriticAgent
 from .rule_optimizer_agent import RuleOptimizerAgent
 from .investigation_agent import InvestigationAgent
 from .skill_designer_agent import SkillDesignerAgent
+from .pm_agent import PMAgent
 
 __all__ = [
     "BAAgent", "DesignAgent", "TechLeadAgent",
     "DevAgent", "TestAgent", "CriticAgent", "RuleOptimizerAgent",
-    "InvestigationAgent", "SkillDesignerAgent",
+    "InvestigationAgent", "SkillDesignerAgent", "PMAgent",
 ]

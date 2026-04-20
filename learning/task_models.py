@@ -85,6 +85,16 @@ class Task:
     assigned_to:  str = ""           # populated by TechLead
     sprint:       int = 0            # 0 = backlog, 1+ = scheduled
     status:       str = "new"        # new | designed | planned | in_dev | tested | done
+    # ── NEW: structured metadata drives Critic-skip decisions + audit log.
+    # When None, caller should call learning.task_metadata.derive_from_task(t).
+    metadata:     "TaskMetadata | None" = None
+
+    def get_metadata(self):
+        """Return metadata, deriving a default one from legacy fields on first access."""
+        if self.metadata is None:
+            from .task_metadata import derive_from_task
+            self.metadata = derive_from_task(self)
+        return self.metadata
 
     @property
     def estimated_hours(self) -> float:
@@ -125,6 +135,11 @@ class Task:
             lines.append(f"**Design ref:** {self.design_ref}")
         if self.assigned_to:
             lines.append(f"**Assigned:** {self.assigned_to} (sprint {self.sprint})")
+        # Structured metadata block — consumed by orchestrator / audit log.
+        if self.metadata is not None:
+            from .task_metadata import render_meta_block
+            lines.append("")
+            lines.append(render_meta_block(self.metadata))
         return "\n".join(lines)
 
 
@@ -195,7 +210,43 @@ def parse_tasks(markdown: str) -> list[Task]:
 
     if current:
         tasks.append(current)
+
+    # Second pass: attach any `json META` block embedded in each task body.
+    _attach_metadata_blocks(tasks, markdown)
     return tasks
+
+
+def _attach_metadata_blocks(tasks: list[Task], markdown: str) -> None:
+    """Split markdown by task headers; try to pull a META block out of each body."""
+    if not tasks:
+        return
+    from .task_metadata import extract_meta_block, derive_from_task
+
+    # Build a lookup by id so we can attach regardless of ordering.
+    by_id = {t.id: t for t in tasks}
+
+    # Split markdown into per-task bodies — delimiter is the task header line.
+    chunks: list[tuple[str, str]] = []   # (task_id, body)
+    current_id: str | None = None
+    current_body: list[str] = []
+    for line in markdown.splitlines():
+        m = _HEADER_RE.match(line)
+        if m:
+            if current_id:
+                chunks.append((current_id, "\n".join(current_body)))
+            current_id = m.group(1)
+            current_body = [line]
+        else:
+            current_body.append(line)
+    if current_id:
+        chunks.append((current_id, "\n".join(current_body)))
+
+    for tid, body in chunks:
+        task = by_id.get(tid)
+        if task is None:
+            continue
+        meta = extract_meta_block(body)
+        task.metadata = meta if meta is not None else derive_from_task(task)
 
 
 # ── Prioritization & topological ordering ────────────────────────────────────

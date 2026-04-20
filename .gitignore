@@ -20,6 +20,12 @@ rules/backups/
 skills/.backups/
 skills/.skill_history.json
 
+# Learning-state artifacts written by IntegrityRules / AuditLog at runtime
+rules/*/.audit/
+rules/*/.learning/
+rules/*/.revise_history.json
+rules/*/integrity.md
+
 # IDE
 .idea/
 .vscode/

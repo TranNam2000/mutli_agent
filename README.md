@@ -7,6 +7,9 @@ A task-based AI pipeline that turns a product idea or bug report into classified
 ```
 Input (task / feature / bug / URL)
     ↓
+PM (route) → kind = feature | bug_fix | ui_tweak | refactor | investigation
+    │             + confidence + reason; sub-pipeline selected per kind
+    ↓
 BA (classify)   → tasks with type={ui,logic,bug,hotfix,mixed}, priority, complexity, risk, business value
     ↓
 Design (reuse-first) → UI tasks routed here; check existing DS → reuse or create
@@ -23,6 +26,18 @@ Auto-feedback → build app, E2E, screenshot diff, logcat → self-heal if BLOCK
     ↓
 HTML dashboard + meta-learning (rules/skills tune themselves)
 ```
+
+### Sub-pipeline per PM `kind`
+
+| kind            | Steps run                                                   |
+|-----------------|-------------------------------------------------------------|
+| `feature`       | BA → Design → TechLead → test_plan → Dev → Test (full)      |
+| `bug_fix`       | BA(lite) → Dev → Test                                       |
+| `ui_tweak`      | BA → Design → Dev → Test (skips TechLead + test_plan)       |
+| `refactor`      | BA → TechLead → Dev → Test (skips Design)                   |
+| `investigation` | Code Investigator only — direct answer, no pipeline         |
+
+PM uses a heuristic keyword pass first; only falls back to an LLM call when the signal is mixed. When confidence `< 0.6` the CLI asks the user to confirm the kind before dispatching.
 
 ## Install
 
@@ -89,8 +104,41 @@ self-improving rules and skills.
 
 ### 1. Critic checklist (per-step)
 
-After each agent produces an output, the Critic grades it against the skill's
-criteria file using **3 levels** (not binary YES/NO):
+Flow on default settings (with structured Task metadata driving the gate):
+
+```
+Fast-Track                               Emergency Audit (if QA fails)
+1. PM / BA   → Critic SKIPPED            1. QA flags BLOCKER + skip happened upstream
+2. TechLead  → Critic CONDITIONAL   ─►   2. RCA entry → audit_log.jsonl
+3. Dev       → Critic MANDATORY          3. Critic forced ON for the rest of the session
+4. Test      → Critic MANDATORY          4. IntegrityRules mutate (module blacklist,
+                                             keyword risk, agent reputation)
+                                         5. integrity.md is regenerated
+```
+
+This cuts ~30–40% of Critic LLM calls per session on average while guaranteeing
+that any pattern that ever caused a false-negative gets Critic forced on in
+future sessions.
+
+**TechLead Critic trigger table** (priority order):
+
+| Condition                                                     | Critic |
+|---------------------------------------------------------------|--------|
+| Env `MULTI_AGENT_TL_CRITIC_ALWAYS=1`                          | RUN    |
+| Env `MULTI_AGENT_TL_CRITIC_NEVER=1`                           | SKIP   |
+| Any task has `complexity=L` or `XL`                           | RUN    |
+| Any task has `type=bug` or `hotfix`                           | RUN    |
+| All tasks have `complexity` ∈ {S, M} on non-bug types         | SKIP   |
+| (fallback) Output mentions core files (main.dart, router, DI) | RUN    |
+| otherwise                                                     | SKIP   |
+
+Core-file detection matches: `main.dart`, `app_router`, `service_locator.dart`,
+`injection_container.dart`, `BaseRepository/BaseBloc/...`, `core/(router|di|network|...)`, `dependency_injection`.
+
+Set `MULTI_AGENT_CRITIC_ALL=1` to run Critic for every step (legacy behaviour).
+
+After a Critic-enabled agent produces an output, the Critic grades it against
+the skill's criteria file using **3 levels** (not binary YES/NO):
 
 | Grade       | Value | Meaning                                                     |
 |-------------|-------|-------------------------------------------------------------|
@@ -212,6 +260,9 @@ export MULTI_AGENT_AUTO_COMMIT=1           # auto-commit Dev step
 export MULTI_AGENT_NO_AUTO_FEEDBACK=0      # skip post-build Maestro/logcat
 export MULTI_AGENT_AUTO_HEAL=1             # auto re-run on BLOCKERs
 export MULTI_AGENT_SKILL_REVIEW=0          # 1 = prompt before writing new skills
+export MULTI_AGENT_CRITIC_ALL=0            # 1 = run Critic for every step (legacy; default only dev+test)
+export MULTI_AGENT_TL_CRITIC_ALWAYS=0      # 1 = always run Critic for TechLead (ignores complexity/type gate)
+export MULTI_AGENT_TL_CRITIC_NEVER=0       # 1 = never run Critic for TechLead (cheapest)
 ```
 
 ## License

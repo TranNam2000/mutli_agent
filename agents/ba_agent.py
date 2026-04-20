@@ -294,6 +294,37 @@ Produce the TASK list in the skill's exact format (## TASK-XXX | type=... | prio
 Each task has full AC (Given/When/Then), classified type (ui|logic|bug|hotfix|mixed), priority (P0-P3), complexity (S/M/L), risk (low/med/high).
 If task has both new UI and new logic → use type=mixed.
 If info missing → append MISSING_INFO: ... — MUST_ASK: ... at end of output.
+
+After each task body, emit a fenced metadata block with this EXACT schema so the
+orchestrator can make skip-Critic decisions:
+
+```json META
+{{
+  "task_id": "<TASK-XXX from header>",
+  "context": {{
+    "scope":      "feature|bug_fix|hotfix|refactor|ui_tweak|investigation",
+    "priority":   "P0|P1|P2|P3",
+    "risk_level": "low|med|high",
+    "complexity": "S|M|L|XL"
+  }},
+  "flow_control": {{
+    "skip_critic":   [],
+    "require_qa":    true,
+    "max_revisions": 2
+  }},
+  "technical_debt": {{
+    "impact_area":     ["ui|state_management|api|payment|auth|core|..."],
+    "legacy_affected": false
+  }}
+}}
+```
+
+Metadata rules:
+- `impact_area` must list concrete modules the task touches. Include "payment",
+  "auth", or "core" when relevant — those force Critic even on tiny tweaks.
+- Set `flow_control.skip_critic = ["PM","BA","TechLead"]` ONLY when ALL of these
+  hold: complexity=S, risk_level=low, impact_area lacks payment/auth/core.
+- Hotfix P0 → `skip_critic = ["PM","BA","TechLead"]` (live-incident Fast-Track).
 """
         return self._call(self.system_prompt, prompt, max_tokens=6000)
 

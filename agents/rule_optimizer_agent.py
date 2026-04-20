@@ -66,6 +66,124 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
         raw = self._call(self.system_prompt, prompt, max_tokens=3000)
         return self._parse_suggestions(raw, profile)
 
+    # ── Integrity-driven suggestions (deterministic, no LLM tokens) ──────────
+
+    def suggest_from_integrity(self, integrity) -> list[dict]:
+        """Translate IntegrityRules state → rule-file ADD suggestions.
+
+        Returns the same shape as `_parse_suggestions` so the orchestrator's
+        existing apply-loop can consume them transparently. This is a pure
+        function of the on-disk integrity tables — zero tokens are spent.
+        """
+        if integrity is None:
+            return []
+        profile = getattr(self, "profile", "default")
+        suggestions: list[dict] = []
+
+        try:
+            from learning.integrity_rules import (
+                MODULE_BLACKLIST_THRESHOLD, REPUTATION_FN_THRESHOLD,
+            )
+        except Exception:
+            MODULE_BLACKLIST_THRESHOLD = 3
+            REPUTATION_FN_THRESHOLD = 2
+
+        # 1) Module blacklist → BA criteria clause.
+        for module, count in (integrity.module_blacklist or {}).items():
+            if count < MODULE_BLACKLIST_THRESHOLD:
+                continue
+            reason = (f"Integrity: module `{module}` recorded {count} "
+                      f"post-skip failures — force Critic when touched.")
+            addition = (
+                f"- Tasks whose `impact_area` or module == `{module}` MUST "
+                f"set `risk_level=high` in metadata and MUST NOT list "
+                f"`BA`, `TechLead`, or `PM` in `flow_control.skip_critic`. "
+                f"({count} prior false-negatives on record.)"
+            )
+            suggestions.append(self._build_integrity_suggestion(
+                agent_key="ba", target_type="criteria",
+                reason=reason, addition=addition, profile=profile,
+            ))
+
+        # 2) Keyword risk table → BA criteria clause.
+        if integrity.keyword_risk:
+            high_kws = sorted(k for k, v in integrity.keyword_risk.items() if v == "high")
+            med_kws  = sorted(k for k, v in integrity.keyword_risk.items() if v == "med")
+            if high_kws:
+                reason = (f"Integrity: {len(high_kws)} keyword(s) promoted "
+                          f"to high-risk via failure history.")
+                lines = ["- When a task description contains any of these "
+                         "keywords, auto-set `risk_level=high`:"]
+                lines += [f"  - `{kw}`" for kw in high_kws]
+                suggestions.append(self._build_integrity_suggestion(
+                    agent_key="ba", target_type="criteria",
+                    reason=reason, addition="\n".join(lines), profile=profile,
+                ))
+            if med_kws:
+                reason = (f"Integrity: {len(med_kws)} keyword(s) promoted "
+                          f"to med-risk via failure history.")
+                lines = ["- Bump `risk_level` at least to `med` when the "
+                         "task mentions any of:"]
+                lines += [f"  - `{kw}`" for kw in med_kws]
+                suggestions.append(self._build_integrity_suggestion(
+                    agent_key="ba", target_type="criteria",
+                    reason=reason, addition="\n".join(lines), profile=profile,
+                ))
+
+        # 3) Agent reputation → reminder clause on that role's rule file.
+        role_to_key = {
+            "BA": "ba", "TechLead": "techlead", "PM": "pm",
+            "Design": "design", "Dev": "dev", "QA": "test",
+        }
+        for role, rep in (integrity.agent_reputation or {}).items():
+            fn = int(rep.get("false_negatives", 0))
+            if fn < REPUTATION_FN_THRESHOLD:
+                continue
+            key = role_to_key.get(role)
+            if key is None:
+                continue
+            reason = (f"Integrity: {role} has {fn} false-negatives from "
+                      f"Fast-Track skip decisions.")
+            addition = (
+                f"- Reputation note: {fn} prior outputs from this role "
+                f"passed Fast-Track (no Critic) and then failed QA. Before "
+                f"allowing `flow_control.skip_critic` to include `{role}` "
+                f"again, you MUST justify in the task description why this "
+                f"specific task avoids the prior failure mode."
+            )
+            suggestions.append(self._build_integrity_suggestion(
+                agent_key=key, target_type="rule",
+                reason=reason, addition=addition, profile=profile,
+            ))
+
+        return suggestions
+
+    def _build_integrity_suggestion(self, *, agent_key: str, target_type: str,
+                                      reason: str, addition: str,
+                                      profile: str) -> dict:
+        """Assemble a suggestion dict in the exact shape orchestrator expects."""
+        current, found_path = _load_rule(agent_key, target_type, profile)
+        if target_type == "criteria":
+            target_path = _RULES_DIR / profile / "criteria" / f"{agent_key}.md"
+        else:
+            target_path = _RULES_DIR / profile / f"{agent_key}.md"
+        if not current:
+            current = ""
+        suggested = current + ("\n\n" if current else "") + addition
+        return {
+            "agent_key":      agent_key,
+            "target_type":    target_type,
+            "action":         "ADD",
+            "replace_section": None,
+            "profile":        profile,
+            "reason":         reason,
+            "addition":       addition,
+            "current_rule":   current,
+            "suggested_rule": suggested,
+            "rule_path":      target_path,
+            "source":         "integrity",
+        }
+
     def _build_rule_context(self, agent_keys: set, profile: str, history) -> str:
         """Build rich context block: current rule + pass patterns + apply history."""
         parts = []

@@ -3,10 +3,65 @@ from __future__ import annotations
 from .base_agent import BaseAgent
 
 
+# Module keywords used by enrich_metadata() to derive impact_area.
+_IMPACT_KEYWORDS = {
+    "payment":           ["payment", "checkout", "stripe", "vnpay", "momo", "paypal"],
+    "auth":              ["auth", "login", "sso", "oauth", "jwt", "token", "password", "session"],
+    "core":              ["main.dart", "app_router", "service_locator",
+                          "base class", "dependency_injection", "di container"],
+    "state_management":  ["bloc", "cubit", "provider", "riverpod", "redux", "mobx"],
+    "api":               ["api", "endpoint", "http", "rest", "graphql", "dio", "retrofit"],
+    "database":          ["database", "sqlite", "hive", "isar", "room"],
+    "ui":                ["screen", "widget", "animation", "layout", "page"],
+    "routing":           ["navigator", "go_router", "deep link", "deeplink", "url"],
+    "storage":           ["shared_preferences", "secure storage", "keychain"],
+    "network":           ["websocket", "socket", "mqtt", "stream"],
+}
+
+
 class TechLeadAgent(BaseAgent):
     ROLE = "Tech Lead"
     RULE_KEY = "techlead"
     SKILL_KEY = "techlead"
+
+    # ── Metadata enrichment (role contribution) ──────────────────────────────
+
+    def enrich_metadata(self, tasks: list) -> int:
+        """
+        Populate each task's metadata with architecture-aware fields:
+          - technical_debt.impact_area (derived from task text via keyword match)
+          - context.risk_level (bumped to 'med' if touching core/payment/auth
+            but currently tagged 'low')
+
+        Returns number of tasks whose metadata was updated.
+        """
+        updated = 0
+        for t in tasks:
+            m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            if m is None:
+                continue
+            hay = " ".join([
+                t.title or "", t.description or "",
+                " ".join(t.acceptance_criteria or []),
+                t.module or "",
+            ]).lower()
+
+            hits: set[str] = set(m.technical_debt.impact_area)
+            for area, kws in _IMPACT_KEYWORDS.items():
+                if any(kw.lower() in hay for kw in kws):
+                    hits.add(area)
+
+            if hits != set(m.technical_debt.impact_area):
+                m.technical_debt.impact_area = sorted(hits)
+                updated += 1
+
+            if m.context.risk_level == "low" and any(
+                a in hits for a in ("core", "payment", "auth")
+            ):
+                m.context.risk_level = "med"
+                updated += 1
+
+        return updated
 
     # ── Task-based flow ───────────────────────────────────────────────────────
 

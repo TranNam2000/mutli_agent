@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 from core.message_bus import MessageBus
-from agents import BAAgent, DesignAgent, TechLeadAgent, DevAgent, TestAgent, CriticAgent, RuleOptimizerAgent, InvestigationAgent, SkillDesignerAgent
+from agents import BAAgent, DesignAgent, TechLeadAgent, DevAgent, TestAgent, CriticAgent, RuleOptimizerAgent, InvestigationAgent, SkillDesignerAgent, PMAgent
+from agents.pm_agent import ALL_KINDS as PM_ALL_KINDS, RouteDecision
 from context.project_context_reader import save_context
 from context.context_builder import ContextBuilder
 from context import session_file
@@ -88,6 +89,7 @@ def _extract_section(text: str, *keywords: str, max_chars: int = 800) -> str:
 
 class ProductDevelopmentOrchestrator:
     PIPELINE = [
+        ("pm",        "🧭 PM Routing",             "classifying request..."),
         ("ba",        "📋 Business Analysis",     "analyzing requirements..."),
         ("design",    "🎨 UI/UX Design",           "designing screens & components..."),
         ("techlead",  "🏗️  Technical Architecture", "designing system & API..."),
@@ -95,7 +97,12 @@ class ProductDevelopmentOrchestrator:
         ("dev",       "💻 Implementation",         "writing production code..."),
         ("test",      "🧪 QA Review",              "verifying implementation against test plan..."),
     ]
-    STEP_KEYS = ["ba", "design", "techlead", "test_plan", "dev", "test"]
+    STEP_KEYS = ["pm", "ba", "design", "techlead", "test_plan", "dev", "test"]
+
+    # Steps that go through Critic scoring + revise loop. Other steps skip
+    # Critic entirely to save ~30–40% of Critic LLM calls per session.
+    # Override via env var `MULTI_AGENT_CRITIC_ALL=1` to restore legacy behavior.
+    CRITIC_STEPS = frozenset({"dev", "test"})
 
     def __init__(self, output_dir: str = "outputs", resume_session: str | None = None, profile: str = "default", maintain_dir: str | None = None, token_budget: int = 500_000):
         from context.project_context_reader import detect_project_name
@@ -130,6 +137,7 @@ class ProductDevelopmentOrchestrator:
             )
 
         self.agents: dict[str, object] = {
+            "pm":       PMAgent(profile=profile),
             "ba":       BAAgent(profile=profile),
             "design":   DesignAgent(profile=profile),
             "techlead": TechLeadAgent(profile=profile),
@@ -144,6 +152,22 @@ class ProductDevelopmentOrchestrator:
         self.maintain_mode = bool(maintain_dir)
         self._maintain_dir: str | None = maintain_dir  # saved for task_hint reload in run()
         self.tokens = TokenTracker(budget=token_budget)
+        # ── Audit / Emergency Audit Mode state ──────────────────────────────
+        # AuditLog is lazily constructed the first time we actually need to
+        # record a false-negative (so tests instantiating the orchestrator
+        # don't create stray log files).
+        self._audit_log = None  # type: ignore[var-annotated]
+        # task_id → list of roles whose Critic was skipped for this task.
+        self._skipped_critic_by_task: dict[str, list[str]] = {}
+        # task_id → predicted metadata snapshot at skip time.
+        self._skip_snapshot: dict[str, dict] = {}
+        # Once set, forces Critic on regardless of metadata — triggered by QA fail.
+        self._emergency_audit: bool = False
+        # Integrity rules — persistent across sessions. Loaded now so
+        # "yesterday's audit findings" actively gate today's skip decisions.
+        from learning.integrity_rules import IntegrityRules
+        from agents.base_agent import _RULES_DIR
+        self._integrity = IntegrityRules(_RULES_DIR / profile)
         all_agents = list(self.agents.values()) + [self.critic, self.rule_optimizer,
                                                     self.investigator, self.skill_designer]
         for agent in all_agents:
@@ -504,13 +528,342 @@ class ProductDevelopmentOrchestrator:
                 tprint(f"  ⚖️  [{agent.ROLE}] score re-weighted by scope={scope}: {old} → {new_final}/10")
         return new_review
 
+    # Patterns that flag a TechLead output as touching "core architecture".
+    # When any of these is matched, we DO run Critic for TL even though
+    # `techlead` is not in CRITIC_STEPS — architecture mistakes are expensive
+    # to find downstream.
+    _CORE_FILE_PATTERNS = (
+        r"\bmain\.dart\b",
+        r"\bapp_router(?:\.dart|\.ts|\.tsx)?\b",
+        r"\brouter\.dart\b|\broutes\.dart\b",
+        r"\binjection(?:_container)?\.dart\b",
+        r"\bdependency[_-]injection\b",
+        r"\bservice_locator\.dart\b",
+        r"\b(?:Base|Abstract)\w*(?:Repository|UseCase|Bloc|Cubit|Widget|Screen)\b",
+        r"\bapp\.dart\b|\bapp\.tsx?\b",
+        r"\bdatabase_helper\b",
+        r"\bnetwork_client\b|\bdio_client\b",
+        r"\bauth_interceptor\b",
+        r"\b_links:\s*\[[^\]]*(main\.dart|app_router|service_locator)",
+        r"\bcore/(?:router|di|network|storage|base|config)\b",
+    )
+
+    def _techlead_touches_core(self, tl_output: str) -> tuple[bool, list[str]]:
+        """Return (touches, matched_patterns). Used to gate Critic for TL."""
+        import re
+        if not tl_output:
+            return False, []
+        matched: list[str] = []
+        for pat in self._CORE_FILE_PATTERNS:
+            m = re.search(pat, tl_output, re.IGNORECASE)
+            if m:
+                matched.append(m.group(0))
+        return (len(matched) > 0, matched)
+
+    # Map internal step key → role name used in TaskMetadata.flow_control.skip_critic.
+    _KEY_TO_ROLE = {
+        "pm":       "PM",
+        "ba":       "BA",
+        "design":   "Design",
+        "techlead": "TechLead",
+        "dev":      "Dev",
+        "test":     "QA",
+    }
+
+    def _get_audit_log(self):
+        """Lazily construct the session-level AuditLog."""
+        if self._audit_log is None:
+            from learning.audit_log import AuditLog
+            from agents.base_agent import _RULES_DIR
+            session_dir = self._checkpoint_path("ba").parent
+            profile_dir = _RULES_DIR / self.profile
+            self._audit_log = AuditLog(session_dir, profile_dir)
+        return self._audit_log
+
+    def _record_critic_skip(self, key: str, tasks: list) -> None:
+        """Remember which roles we skipped for each task — needed for RCA later."""
+        role = self._KEY_TO_ROLE.get(key, key.upper())
+        for t in tasks:
+            tid = getattr(t, "id", None)
+            if not tid:
+                continue
+            self._skipped_critic_by_task.setdefault(tid, []).append(role)
+            m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            if m and tid not in self._skip_snapshot:
+                self._skip_snapshot[tid] = m.to_dict()
+
+    def _trigger_emergency_audit(self, blockers: list[str], tasks: list,
+                                  agent_in_charge: str = "Dev") -> list[dict]:
+        """Activate Emergency Audit Mode: record false-negatives + force Critic.
+
+        Called the first time QA surfaces BLOCKERs. Returns list of audit
+        entries written so callers can render a human-friendly summary.
+        """
+        if self._emergency_audit:
+            # Already active — still log, but don't re-announce.
+            pass
+        else:
+            tprint(f"\n  {'🚨'*3}  EMERGENCY AUDIT MODE  {'🚨'*3}")
+            tprint(f"     QA found {len(blockers)} BLOCKER(s) on tasks that had "
+                   f"Critic skipped — activating full audit.")
+            tprint(f"     Critic will be FORCED ON for the remainder of this session.")
+            tprint(f"  {'─'*60}")
+            self._emergency_audit = True
+
+        # Only log false-negatives for tasks where we actually skipped some role.
+        entries: list[dict] = []
+        if not tasks:
+            return entries
+        from learning.audit_log import classify_outcome, make_root_cause_hint
+        outcome = classify_outcome(blockers)
+        audit = self._get_audit_log()
+        for t in tasks:
+            tid = getattr(t, "id", None)
+            if not tid:
+                continue
+            skipped_roles = self._skipped_critic_by_task.get(tid, [])
+            if not skipped_roles:
+                continue   # no skip happened → not a false-negative
+            meta = self._skip_snapshot.get(tid, {})
+            hint = make_root_cause_hint(meta, skipped_roles, blockers)
+            e = audit.record(
+                session_id=self.session_id,
+                task_id=tid,
+                predicted_metadata=meta,
+                skipped_for_roles=skipped_roles,
+                actual_outcome=outcome,
+                blockers=blockers,
+                agent_in_charge=agent_in_charge,
+                root_cause_hint=hint,
+            )
+            entries.append(e)
+            tprint(f"     📼 RCA logged for {tid}: {hint}")
+
+            # Mutate metadata in memory so downstream (revise loop, RuleOptimizer)
+            # sees the upgraded risk.
+            m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            if m is not None:
+                m.context.risk_level = "high"
+                # Clear skip_critic list so future runs respect the upgrade.
+                m.flow_control.skip_critic = []
+
+            # Feed the failure into IntegrityRules so future sessions learn.
+            if getattr(self, "_integrity", None) is not None:
+                change = self._integrity.record_failure(
+                    module=getattr(t, "module", ""),
+                    impact_areas=(m.technical_debt.impact_area if m else []),
+                    agent_in_charge=agent_in_charge,
+                    skipped_roles=skipped_roles,
+                    blockers=blockers,
+                )
+                bumped = ", ".join(
+                    f"{b['module']}({b['count']})" for b in change.get("modules_bumped", [])
+                )
+                if bumped:
+                    tprint(f"     🏷  Module counter bumped: {bumped}")
+                for fw in change.get("new_forced_windows", []):
+                    tprint(f"     🔒 {fw['role']} entered forced-Critic "
+                           f"window ({fw['window']} tasks)")
+                for kw in change.get("keywords_promoted", []):
+                    tprint(f"     🆙 Keyword risk: '{kw['keyword']}' → "
+                           f"{kw['risk']}")
+
+        # Regenerate the human-readable integrity.md artefact (the demo file).
+        if entries and getattr(self, "_integrity", None) is not None:
+            from agents.base_agent import _RULES_DIR
+            path = self._integrity.write_integrity_rules_md(_RULES_DIR / self.profile)
+            tprint(f"     📜 integrity.md updated → {path}")
+
+        return entries
+
+    def _fast_track_announce(self, key: str, context: dict) -> None:
+        """Print a human-readable 'Fast-Track' message explaining why Critic
+        was skipped for this step. Uses metadata in context when available."""
+        tasks = context.get("tasks") or []
+        reason = "low-risk step"
+        if tasks:
+            if any(t.get_metadata().is_hot_p0() for t in tasks):
+                reason = "hotfix P0 — skipping intermediate Critic for speed"
+            elif all(t.get_metadata().is_low_risk_small() for t in tasks):
+                reason = "all tasks Low-risk + S complexity → Fast-Track mode"
+            elif key == "techlead":
+                reason = "standard op (no core-file touches, no L/XL) → straight to Dev"
+
+        # Big marquee message for the "Fast-Track" narrative.
+        tprint(f"  🚀 Fast-Track: Critic skipped for [{key}] ({reason}) "
+               f"— saving ~1 LLM call")
+
+    def _critic_enabled_for(self, key: str, output: str = "",
+                             context: dict | None = None) -> bool:
+        """True iff Critic should run for this step key.
+
+        Decision order (highest precedence first):
+          1. MULTI_AGENT_CRITIC_ALL=1 → always run (legacy).
+          2. Role-specific env override (MULTI_AGENT_TL_CRITIC_ALWAYS/NEVER).
+          3. Metadata-driven rules derived from the tasks in `context["tasks"]`:
+             3a. If ANY task is `hotfix+P0` → skip PM/BA/TL, keep Dev/QA.
+             3b. If ANY task.touches_core() → force Critic (payment/auth/core).
+             3c. If ALL tasks are S+low → skip PM/BA/TL.
+             3d. Per-task `flow_control.skip_critic` inclusion of this role.
+          4. TechLead secondary rule (unchanged): any L/XL or bug/hotfix type.
+          5. Fallback: key in CRITIC_STEPS (dev, test).
+
+        `context` may contain:
+          {"tasks": [Task, Task, ...]}   # preferred (metadata-driven)
+          {"tl_complexities": ["S","M"], "tl_types": ["logic","bug"]}  # legacy
+        """
+        if os.environ.get("MULTI_AGENT_CRITIC_ALL", "0") == "1":
+            return True
+        # Emergency Audit Mode — a false-negative has already bitten us in
+        # this session, so the whole pipeline is demoted to "Critic everywhere"
+        # until the session ends.
+        if getattr(self, "_emergency_audit", False):
+            return True
+
+        # Integrity rules — learned from past sessions.
+        integrity = getattr(self, "_integrity", None)
+        role = self._KEY_TO_ROLE.get(key, key.upper())
+
+        # (a) Forced-Critic window for a role whose reputation is bad.
+        if integrity is not None and integrity.role_has_forced_window(role):
+            tprint(f"  🛡  Forced-Critic window active for {role} — running Critic")
+            integrity.consume_forced_window(role)
+            return True
+
+        # (b) Module blacklist: any task's impact_area matches → force Critic.
+        if integrity is not None:
+            tasks_ctx = (context or {}).get("tasks") or []
+            for t in tasks_ctx:
+                m = t.get_metadata() if hasattr(t, "get_metadata") else None
+                if not m:
+                    continue
+                areas = list(m.technical_debt.impact_area) + [
+                    getattr(t, "module", "") or ""
+                ]
+                if any(integrity.module_forces_critic(a) for a in areas if a):
+                    tprint(f"  🛡  Module in integrity blacklist → running Critic")
+                    return True
+
+        # TechLead env overrides kept for backward compat.
+        if key == "techlead":
+            if os.environ.get("MULTI_AGENT_TL_CRITIC_NEVER", "0") == "1":
+                return False
+            if os.environ.get("MULTI_AGENT_TL_CRITIC_ALWAYS", "0") == "1":
+                return True
+
+        role = self._KEY_TO_ROLE.get(key, key.upper())
+        ctx = context or {}
+        tasks = ctx.get("tasks") or []
+
+        # Backward-compat: if caller only passed tl_complexities/tl_types but
+        # no full Task list, synthesise a lightweight context.
+        complexities: list[str] = [str(c).upper() for c in ctx.get("tl_complexities", [])]
+        types:        list[str] = [str(t).lower() for t in ctx.get("tl_types", [])]
+        for t in tasks:
+            m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            if m:
+                complexities.append(m.context.complexity)
+                types.append(m.context.scope)
+
+        # ── Metadata-driven rules ──
+        if tasks:
+            any_hot_p0       = any(t.get_metadata().is_hot_p0()       for t in tasks)
+            any_touches_core = any(t.get_metadata().touches_core()    for t in tasks)
+            all_low_small    = all(t.get_metadata().is_low_risk_small() for t in tasks)
+
+            # 3a. Hotfix P0 → skip PM/BA/TL, keep Dev+QA regardless.
+            if any_hot_p0 and key in ("pm", "ba", "techlead", "design", "test_plan"):
+                return False
+
+            # 3b. Core-touch task → force Critic on TL (and Dev/Test are already on).
+            if any_touches_core and key == "techlead":
+                return True
+
+            # 3c. All tasks low-risk + S complexity → skip PM/BA/TL bundle.
+            if all_low_small and key in ("pm", "ba", "techlead"):
+                return False
+
+            # 3d. Respect per-task skip list: if every task in scope has skipped
+            # this role, honour it.
+            if all(role in t.get_metadata().flow_control.skip_critic for t in tasks):
+                return False
+
+        # ── TechLead secondary rules (unchanged) ──
+        if key == "techlead":
+            if any(c in ("L", "XL") for c in complexities):
+                return True
+            if any(t in ("bug", "bug_fix", "hotfix") for t in types):
+                return True
+            if complexities and all(c in ("S", "M") for c in complexities):
+                return False
+            touches, _ = self._techlead_touches_core(output)
+            return touches
+
+        return key in self.CRITIC_STEPS
+
+    def _review_only(self, key: str, agent, output: str,
+                      original_prompt: str = "", context: dict | None = None) -> str:
+        """Critic-review an already-produced output (no produce_fn).
+
+        Used for agents like TechLead whose output is assembled from multiple
+        internal calls — we don't want to re-run production, only ask Critic
+        to score the final artefact.
+        """
+        if not self._critic_enabled_for(key, output, context):
+            self._fast_track_announce(key, context or {})
+            self._record_critic_skip(key, (context or {}).get("tasks") or [])
+            return output
+        if key == "techlead":
+            _, matches = self._techlead_touches_core(output)
+            tprint(f"  🏛️  TechLead touched core files {matches[:3]} → running Critic")
+
+        for round_num in range(1, self.critic.MAX_ROUNDS + 1):
+            tprint(f"  🔍 Critic reviewing [{key}] round {round_num}...")
+            review = self.critic.evaluate(
+                agent.ROLE, output, agent_key=key,
+                original_context=original_prompt,
+            )
+            review = self._apply_dynamic_weights(review, agent)
+            threshold = review.get("pass_threshold", 7)
+            review["verdict"] = "PASS" if review["score"] >= threshold else "REVISE"
+            self.critic.print_review(agent.ROLE, review, round_num)
+            self.critic_reviews.append({**review, "agent_key": key,
+                                        "agent_role": agent.ROLE, "round": round_num})
+            if review["verdict"] == "PASS":
+                break
+            if round_num < self.critic.MAX_ROUNDS:
+                tprint(f"\n  🔄 {agent.ROLE} is improving its output...")
+                output = agent.revise(output, review["revision_guide"], original_prompt)
+                self._save(key, output)
+                self.results[key] = output
+            else:
+                output = self._escalate(key, agent, output, review, original_prompt)
+        return output
+
     def _run_with_review(self, key: str, agent, produce_fn, original_prompt: str = "") -> str:
-        """Run agent, then Critic reviews with multi-dimensional scoring. Max 2 rounds."""
+        """Run agent, then Critic reviews with multi-dimensional scoring. Max 2 rounds.
+
+        If `key` is not in CRITIC_STEPS (and MULTI_AGENT_CRITIC_ALL is off), skip
+        the Critic + revise loop entirely — save ~1 Critic call + up to 1 revise
+        call per low-risk step.
+        """
         self._maybe_refresh_context()
         self._detect_skill_for(agent, original_prompt)
         output = produce_fn()
         self._save(key, output)
         self.results[key] = output
+
+        if not self._critic_enabled_for(key, output):
+            self._fast_track_announce(key, {})
+            # _run_with_review doesn't currently pass a task list, so we can
+            # only log the skip with an empty task scope. Emergency audit
+            # will still fire via the TechLead path which does pass tasks.
+            return output
+        if key == "techlead":
+            _, matches = self._techlead_touches_core(output)
+            tprint(f"  🏛️  TechLead touched core files {matches[:3]}"
+                   f" → running Critic")
+
         for round_num in range(1, self.critic.MAX_ROUNDS + 1):
             tprint(f"  🔍 Critic reviewing [{key}] round {round_num}...")
             review = self.critic.evaluate(
@@ -594,10 +947,124 @@ class ProductDevelopmentOrchestrator:
 
     # ── Main pipeline ─────────────────────────────────────────────────────────
 
+    # ── PM router (Step 0) ────────────────────────────────────────────────────
+
+    def _run_pm_router(self, product_idea: str) -> RouteDecision:
+        """
+        Classify the request and decide which sub-pipeline to run.
+
+        Returns a RouteDecision. The caller is expected to consult
+        decision.dispatch_steps() to know which agents to run.
+
+        Honors checkpoints — if pm.md already exists for this session, parse it
+        back into a RouteDecision and skip the LLM call.
+        """
+        pm: PMAgent = self.agents["pm"]
+
+        # Resume from checkpoint if present.
+        if self._step_done("pm"):
+            cached = self.results.get("pm", "")
+            parsed_kind = None
+            parsed_conf = 0.85  # assume previous run had good confidence
+            import re as _re
+            m = _re.search(r"\*\*Kind\*\*:\s*`([a-z_]+)`", cached)
+            if m and m.group(1) in PM_ALL_KINDS:
+                parsed_kind = m.group(1)
+            if parsed_kind:
+                self._skip("pm", "PM Router")
+                return RouteDecision(
+                    kind=parsed_kind,
+                    confidence=parsed_conf,
+                    reason="(restored from checkpoint)",
+                    source="checkpoint",
+                )
+            # Fall through to re-run if checkpoint was malformed.
+
+        if not self._check_quota("PM routing"):
+            # Quota blown — default to feature to preserve legacy behavior.
+            return RouteDecision(
+                kind="feature", confidence=0.5,
+                reason="PM skipped due to token quota.", source="default",
+            )
+
+        self._header(0, len(self.PIPELINE), "PM Router", "classifying request...")
+        pm._current_step = "pm"
+        try:
+            pm.detect_skill(product_idea)
+        except Exception:
+            pass
+        decision = pm.classify(product_idea)
+
+        # Low-confidence path → ask user to confirm the kind.
+        if decision.confidence < 0.6:
+            decision = self._pm_clarify_with_user(decision, product_idea)
+
+        tprint(f"\n  🧭 PM routed → kind=`{decision.kind}` "
+               f"(confidence={decision.confidence:.2f}, via {decision.source})")
+        tprint(f"     Reason: {decision.reason[:120]}")
+        tprint(f"     Dispatch: {' → '.join(decision.dispatch_steps())}")
+
+        self._save("pm", decision.to_markdown())
+        self.results["pm"] = decision.to_markdown()
+        self._step_token_status("PM")
+        return decision
+
+    def _pm_clarify_with_user(self, decision: RouteDecision, product_idea: str) -> RouteDecision:
+        """Interactive fallback when PM confidence < 0.6."""
+        tprint(f"\n  ⚠️  PM confidence {decision.confidence:.2f} is low — please confirm.")
+        tprint(f"     PM suggestion: {decision.kind}")
+        tprint(f"     Reason: {decision.reason}")
+        tprint(f"\n     Kinds:")
+        for i, k in enumerate(PM_ALL_KINDS, 1):
+            marker = " ← PM pick" if k == decision.kind else ""
+            tprint(f"       {i}. {k}{marker}")
+
+        while True:
+            raw = input("\n     Pick kind [1-5] or Enter to accept PM pick: ").strip()
+            if not raw:
+                return decision
+            if raw.isdigit() and 1 <= int(raw) <= len(PM_ALL_KINDS):
+                chosen = PM_ALL_KINDS[int(raw) - 1]
+                return RouteDecision(
+                    kind=chosen,
+                    confidence=1.0,
+                    reason=f"User confirmed after low-confidence PM pick ({decision.kind}).",
+                    source="user",
+                )
+            if raw in PM_ALL_KINDS:
+                return RouteDecision(
+                    kind=raw, confidence=1.0,
+                    reason="User confirmed kind by name.",
+                    source="user",
+                )
+            tprint("     Invalid choice. Enter 1-5 or a kind name.")
+
+    def _run_investigation_path(self, product_idea: str) -> dict:
+        """Sub-pipeline for kind=investigation — skip BA/Design/TL/Dev/Test."""
+        self._header(1, 1, "Code Investigator", "answering request via investigation only...")
+        if not self._check_quota("Investigation"):
+            return {}
+        try:
+            if not self.investigator.project_context:
+                # Investigation without a project context still runs, but degrades to Q&A.
+                tprint("  ℹ️  No project context loaded — running Q&A mode.")
+            report = self.investigator.investigate(product_idea)
+        except Exception as e:
+            tprint(f"  ❌ Investigation failed: {e}")
+            return {}
+
+        if report:
+            self.investigator.print_report(report)
+            self._save("investigation", report)
+            self.results["investigation"] = report
+        self._step_token_status("Investigation")
+        return self.results
+
     # ── Task-based pipeline (NEW FLOW) ────────────────────────────────────────
 
     def _run_task_based_pipeline(self, product_idea: str,
-                                  resources: dict | None = None) -> dict:
+                                  resources: dict | None = None,
+                                  allowed_steps: list[str] | None = None) -> dict:
         """
         New flow:
           1. BA.produce_tasks → classified task list (ui/logic/bug/hotfix/mixed)
@@ -617,8 +1084,18 @@ class ProductDevelopmentOrchestrator:
         dev  = self.agents["dev"]
         qa   = self.agents["test"]
 
+        def _allowed(step: str) -> bool:
+            """True if step should run. None = legacy 'run everything' mode."""
+            return allowed_steps is None or step in allowed_steps
+
+        if allowed_steps is not None:
+            tprint(f"\n  🧭 Sub-pipeline from PM: {' → '.join(allowed_steps)}")
+
         # ── STEP 1: BA builds classified task list ────────────────────────────
-        if self._step_done("ba"):
+        if not _allowed("ba") and not self._step_done("ba"):
+            tprint("  ⏭️  BA skipped (not in PM dispatch plan)")
+            tasks_md = ""
+        elif self._step_done("ba"):
             self._skip("ba", "BA (task producer)")
             tasks_md = self.results["ba"]
         else:
@@ -632,11 +1109,27 @@ class ProductDevelopmentOrchestrator:
             )
             self._step_token_status("BA")
 
-        tasks = parse_tasks(tasks_md)
+        tasks = parse_tasks(tasks_md) if tasks_md else []
         if not tasks:
-            tprint("\n  ❌ Could not parse any tasks from BA output — STOP.")
-            tprint("     Check that BA output follows format `## TASK-XXX | type=... | priority=...` no.")
-            return {}
+            if allowed_steps is not None and "ba" not in allowed_steps:
+                # BA was intentionally skipped — synthesize a placeholder task
+                # so downstream Dev/Test still have something to chew on.
+                from learning.task_models import Task, TaskType, Priority, Complexity, Risk, BusinessValue
+                tasks = [Task(
+                    id="TASK-PM-001",
+                    title=(product_idea.strip().splitlines() or ["Request from PM"])[0][:80],
+                    description=product_idea,
+                    type=TaskType.LOGIC,
+                    priority=Priority.P2,
+                    complexity=Complexity.M,
+                    risk=Risk.MED,
+                    business_value=BusinessValue.NORMAL,
+                )]
+                tasks_md = tasks[0].to_markdown()
+            else:
+                tprint("\n  ❌ Could not parse any tasks from BA output — STOP.")
+                tprint("     Check that BA output follows format `## TASK-XXX | type=... | priority=...` no.")
+                return {}
 
         # Auto-split MIXED tasks into UI + Logic children
         from learning.task_models import expand_mixed_tasks
@@ -654,7 +1147,9 @@ class ProductDevelopmentOrchestrator:
         # ── STEP 2: Design handles UI tasks (find or create) ─────────────────
         design_refs: dict[str, str] = {}
         ui_tasks = split["ui"]
-        if ui_tasks and not self._step_done("design"):
+        if not _allowed("design") and not self._step_done("design"):
+            tprint("  ⏭️  Design skipped (not in PM dispatch plan)")
+        elif ui_tasks and not self._step_done("design"):
             if not self._check_quota("Design UI tasks"): return {}
             self._header(2, 6, "Designer", f"processing {len(ui_tasks)} UI tasks (reuse or create)...")
             des._current_step = "design"
@@ -685,7 +1180,11 @@ class ProductDevelopmentOrchestrator:
             tasks = parse_tasks(tasks_md)
 
         # ── STEP 4: TechLead prioritize + assign sprint ──────────────────────
-        if self._step_done("techlead"):
+        if not _allowed("techlead") and not self._step_done("techlead"):
+            tprint("  ⏭️  TechLead skipped (not in PM dispatch plan) — using tasks directly")
+            sprint_md = tasks_md  # Dev will consume the raw task list instead.
+            sprint_plan = None
+        elif self._step_done("techlead"):
             self._skip("techlead", "Tech Lead (prioritizer)")
             sprint_md = self.results["techlead"]
             sprint_plan = None
@@ -695,6 +1194,12 @@ class ProductDevelopmentOrchestrator:
                          "evaluating resources + prioritize sprint...")
             tl._current_step = "techlead"
             tl.detect_skill(product_idea)
+            # Role contribution: TL enriches metadata (impact_area + risk bump)
+            # before its Critic gate is evaluated.
+            if hasattr(tl, "enrich_metadata"):
+                changed = tl.enrich_metadata(tasks)
+                if changed:
+                    tprint(f"  🧠 TechLead enriched metadata on {changed} task(s)")
             result = tl.prioritize_and_assign(tasks, resources)
             sprint_plan = result["sprint_plan"]
             sprint_md = result["summary_markdown"]
@@ -705,18 +1210,39 @@ class ProductDevelopmentOrchestrator:
                 tprint(f"\n  🔧 TechLead adjusted {len(result['adjustments'])} estimates")
             self._step_token_status("TechLead")
 
+            # Conditional Critic: gate by metadata (complexity, risk, impact).
+            tl_ctx = {
+                "tasks": tasks,
+                # Legacy fields — kept for older callers & fallback logic.
+                "tl_complexities": [t.complexity.value for t in tasks],
+                "tl_types":        [t.type.value       for t in tasks],
+            }
+            sprint_md = self._review_only(
+                "techlead", tl, sprint_md,
+                original_prompt=tasks_md, context=tl_ctx,
+            )
+            self.results["techlead"] = sprint_md
+
         # ── STEP 5: parallel Test Plan + Dev ─────────────────────────────────
-        if not self._step_done("test_plan"):
+        if not _allowed("test_plan") and not self._step_done("test_plan"):
+            tprint("  ⏭️  Test plan skipped (not in PM dispatch plan)")
+        elif not self._step_done("test_plan"):
             if not self._check_quota("Test plan from sprint"): return {}
             self._header(4, 6, "QA (planner)", "writing test plan in sprint priority order...")
             qa._current_step = "test_plan"
             qa.detect_skill(product_idea)
-            test_plan = qa.plan_from_sprint(sprint_plan, tasks)
+            if sprint_plan is not None:
+                test_plan = qa.plan_from_sprint(sprint_plan, tasks)
+            else:
+                # TechLead was skipped — plan from raw tasks.
+                test_plan = qa.plan_from_sprint(None, tasks) if hasattr(qa, "plan_from_sprint") else ""
             self._save("test_plan", test_plan)
             self.results["test_plan"] = test_plan
             self._step_token_status("TestPlan")
 
-        if not self._step_done("dev"):
+        if not _allowed("dev") and not self._step_done("dev"):
+            tprint("  ⏭️  Dev skipped (not in PM dispatch plan)")
+        elif not self._step_done("dev"):
             if not self._check_quota("Dev implementation"): return {}
             self._header(5, 6, "Developer", "implementing tasks in sprint order...")
             dev._current_step = "dev"
@@ -737,7 +1263,9 @@ class ProductDevelopmentOrchestrator:
             self._save_implementation_files(impl)
 
         # ── STEP 6: QA review + fix loop ─────────────────────────────────────
-        if not self._step_done("test"):
+        if not _allowed("test") and not self._step_done("test"):
+            tprint("  ⏭️  QA review skipped (not in PM dispatch plan)")
+        elif not self._step_done("test"):
             if not self._check_quota("QA review"): return {}
             self._header(6, 6, "QA (reviewer)", "verifying implementation against test plan...")
             qa._current_step = "test_review"
@@ -753,6 +1281,7 @@ class ProductDevelopmentOrchestrator:
             implementation = self._qa_dev_loop(
                 qa, dev, tl, self.results.get("test_plan", ""),
                 self.results.get("dev", ""), "", review, product_idea,
+                tasks=tasks,
             )
             self._save_flutter_tests(self.results.get("test", ""))
 
@@ -790,17 +1319,38 @@ class ProductDevelopmentOrchestrator:
         tprint(f"  Project : {self.project_name}")
         tprint(f"  Profile : {self.profile}")
         tprint(f"  Idea    : {product_idea[:80]}...")
-        tprint("\n  Flow: BA(classify) → [UI→Design→BA] → TechLead(prioritize) → Dev ∥ Test\n")
+        tprint("\n  Flow: PM(route) → [BA/Design/TechLead/test_plan/Dev/Test] per kind\n")
 
         if not self.maintain_mode:
             self._detect_maintain_from_task(product_idea)
 
+        # ── PM router runs BEFORE BA clarification so Investigation kind
+        #    can skip the heavy clarification gate.
+        route = self._run_pm_router(product_idea)
+
+        if route.kind == "investigation":
+            if self.maintain_mode and self._maintain_dir:
+                self._load_project_context(self._maintain_dir, task_hint=product_idea)
+            self._run_investigation_path(product_idea)
+            # Light-weight wrap-up (skip rule/skill optimizers — nothing to score).
+            self._save_conversations()
+            self.bus.print_log()
+            tprint(f"\n{'✅'*5}  INVESTIGATION COMPLETE  {'✅'*5}")
+            tprint(self.tokens.full_report())
+            return self.results
+
+        # Non-investigation: fall through to the full task-based flow, but
+        # restrict which steps run per PM's dispatch plan.
         product_idea = self._clarification_gate(product_idea)
 
         if self.maintain_mode and self._maintain_dir:
             self._load_project_context(self._maintain_dir, task_hint=product_idea)
 
-        self._run_task_based_pipeline(product_idea, resources=resources)
+        self._run_task_based_pipeline(
+            product_idea,
+            resources=resources,
+            allowed_steps=route.dispatch_steps(),
+        )
 
         self._apply_outcome_adjustments(product_idea)
         self._run_rule_optimizer()
@@ -1136,6 +1686,18 @@ class ProductDevelopmentOrchestrator:
         suggestions = self.rule_optimizer.analyze_and_suggest(
             revise_reviews, chronic_patterns, history=history, easy_items=easy_items
         )
+        # Add deterministic IntegrityRules-driven suggestions. These are
+        # "yesterday's lessons": modules with persistent failures, keyword
+        # risk promotions, and agent reputation penalties — translated into
+        # concrete rule-file edits without any extra LLM cost.
+        integrity_suggestions = self.rule_optimizer.suggest_from_integrity(
+            getattr(self, "_integrity", None)
+        )
+        if integrity_suggestions:
+            tprint(f"\n  🧬 Integrity surface {len(integrity_suggestions)} "
+                   f"deterministic rule suggestion(s) (no LLM cost)")
+            suggestions = list(suggestions or []) + integrity_suggestions
+
         if not suggestions:
             tprint("  No tìm thấy pattern bug rõ ràng to cải tcurrent.")
             return
@@ -1570,6 +2132,7 @@ class ProductDevelopmentOrchestrator:
         dev_clarification: str,
         initial_review: str,
         product_idea: str,
+        tasks: list | None = None,
     ) -> str:
         """
         QA finds BLOCKERs → reports to TechLead → TechLead triages → Dev fixes → QA re-verifies.
@@ -1581,12 +2144,19 @@ class ProductDevelopmentOrchestrator:
         review_output = initial_review
         prev_blocker_set: set[str] = set()
         round_num = 0
+        audit_tasks = tasks or []
 
         while True:
             blockers = self._extract_blockers(review_output)
             if not blockers:
                 tprint(f"\n  ✅ QA: No có BLOCKER — implementation đạt request.")
                 break
+
+            # ── Emergency Audit Mode: only on the first iteration, and only
+            # when some upstream Critic was actually skipped for these tasks.
+            if round_num == 0 and self._skipped_critic_by_task and not self._emergency_audit:
+                self._trigger_emergency_audit(blockers, audit_tasks,
+                                               agent_in_charge="Dev")
 
             round_num += 1
             tprint(f"\n  {'═'*60}")
