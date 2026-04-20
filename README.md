@@ -8,21 +8,38 @@ A task-based AI pipeline that turns a product idea or bug report into classified
 Input (task / feature / bug / URL)
     ↓
 PM (route) → kind = feature | bug_fix | ui_tweak | refactor | investigation
-    │             + confidence + reason; sub-pipeline selected per kind
+    │         + confidence + reason; sub-pipeline + fast-track gate selected
+    │         ▼
+    │   [authoritative for `scope` in task metadata]
     ↓
-BA (classify)   → tasks with type={ui,logic,bug,hotfix,mixed}, priority, complexity, risk, business value
+BA (classify) → structured Task list + ```json META``` block per task
+    │           (metadata: context / flow_control / technical_debt)
     ↓
 Design (reuse-first) → UI tasks routed here; check existing DS → reuse or create
     ↓
 BA (consolidate) → merge design refs back into task list
     ↓
-TechLead (prioritize) → validate estimates, pack into sprints per team capacity
+TechLead (prioritize) → enrich_metadata(impact_area, risk_bump)
+    │                  → validate estimates + sprint packing
+    │                  → conditional Critic (complexity/type/core-file gate)
     ↓
 Dev ∥ Test (parallel) → implementation + test plan in priority order
     ↓
 QA → Dev fix loop → Patrol + Maestro auto-run
+    │               ↓
+    │         ┌─ BLOCKER on a task that had Critic skipped upstream? ─┐
+    │         ↓                                                       │
+    │   🚨 EMERGENCY AUDIT MODE                                       │
+    │     1. audit_log.jsonl records RCA entry                        │
+    │     2. Critic forced ON for rest of session                     │
+    │     3. IntegrityRules: module blacklist, keyword risk,          │
+    │        agent reputation bumped                                  │
+    │     4. integrity.md regenerated                                 │
+    └─────────────────────────────────────────────────────────────────┘
     ↓
 Auto-feedback → build app, E2E, screenshot diff, logcat → self-heal if BLOCKERs
+    ↓
+RuleOptimizer (LLM) + suggest_from_integrity (zero-token)
     ↓
 HTML dashboard + meta-learning (rules/skills tune themselves)
 ```
@@ -32,12 +49,95 @@ HTML dashboard + meta-learning (rules/skills tune themselves)
 | kind            | Steps run                                                   |
 |-----------------|-------------------------------------------------------------|
 | `feature`       | BA → Design → TechLead → test_plan → Dev → Test (full)      |
-| `bug_fix`       | BA(lite) → Dev → Test                                       |
-| `ui_tweak`      | BA → Design → Dev → Test (skips TechLead + test_plan)       |
-| `refactor`      | BA → TechLead → Dev → Test (skips Design)                   |
+| `bug_fix`       | Dev → Test                                                  |
+| `ui_tweak`      | Design → Dev → Test                                         |
+| `refactor`      | TechLead → Dev → Test                                       |
 | `investigation` | Code Investigator only — direct answer, no pipeline         |
 
-PM uses a heuristic keyword pass first; only falls back to an LLM call when the signal is mixed. When confidence `< 0.6` the CLI asks the user to confirm the kind before dispatching.
+PM uses a heuristic keyword pass first (Vietnamese diacritics aware); only
+falls back to an LLM call when the signal is mixed. When confidence `< 0.6`
+the CLI asks the user to confirm the kind before dispatching. PM then stamps
+its `kind` onto every task's `metadata.context.scope` — downstream gates,
+audit log, and RuleOptimizer all read from there (single source of truth).
+
+## Task Metadata — the "nervous system"
+
+Every task carries a structured JSON metadata block emitted by BA and enriched
+by TechLead. The orchestrator reads this metadata at every skip/run decision,
+the audit log captures it when a failure happens, and the learning tables
+consume it across sessions.
+
+```json
+{
+  "task_id": "BUG-12345",
+  "context": {
+    "scope":      "feature | bug_fix | hotfix | refactor | ui_tweak",
+    "priority":   "P0 | P1 | P2 | P3",
+    "risk_level": "low | med | high",
+    "complexity": "S | M | L | XL"
+  },
+  "flow_control": {
+    "skip_critic":   ["PM", "BA", "TechLead"],
+    "require_qa":    true,
+    "max_revisions": 2
+  },
+  "technical_debt": {
+    "impact_area":     ["ui", "payment", "auth", "api", "..."],
+    "legacy_affected": false
+  }
+}
+```
+
+**Who fills what:**
+
+| Field                             | Authoritative writer                              |
+|-----------------------------------|---------------------------------------------------|
+| `context.scope`                   | **PM** (overrides any BA value after parse)       |
+| `context.priority`                | BA                                                |
+| `context.complexity`              | BA, adjusted by TechLead                          |
+| `context.risk_level`              | BA, bumped by TechLead when `impact_area` hits core/payment/auth |
+| `technical_debt.impact_area`      | **TechLead** (`enrich_metadata` keyword match)    |
+| `flow_control.skip_critic`        | BA (guided by prompt rules)                       |
+
+**Decision helpers** used by the orchestrator's Critic gate:
+
+- `is_low_risk_small()` — `complexity=S` AND `risk_level=low`
+- `is_hot_p0()` — `scope=hotfix` AND `priority=P0`
+- `touches_core()` — `impact_area` contains `core`, `payment`, `auth`, or `security`
+
+## Emergency Audit Mode
+
+When QA surfaces BLOCKERs on a task that had Critic skipped upstream, the
+orchestrator auto-activates Full-Audit Mode:
+
+1. Records a JSONL row in `<session>/audit_log.jsonl` and rolls it up into
+   the profile-level `rules/<profile>/.audit/aggregate.jsonl`.
+2. Sets `_emergency_audit=True` → every subsequent step forces Critic on.
+3. Upgrades the offending task's `risk_level` to `high` and clears its
+   `skip_critic` list in-memory.
+4. Calls `IntegrityRules.record_failure()`:
+   - `module_blacklist[impact_area] += 1`
+   - `agent_reputation[role].false_negatives += 1` (and starts a
+     forced-Critic window of 5 tasks when threshold is crossed)
+   - `keyword_risk[matched]` promoted to `high`/`med`
+5. Regenerates `rules/<profile>/integrity.md` — a human-readable summary
+   of all three learning tables.
+
+## Self-evolving rules
+
+RuleOptimizer has two sources of suggestions merged each session:
+
+- **LLM-driven** (paid): analyses `critic_reviews`, chronic patterns and
+  "easy items" and asks Claude to propose rule edits.
+- **Integrity-driven** (free, new): `suggest_from_integrity()` reads the
+  three learning tables and deterministically emits ADD suggestions like:
+  - "Tasks touching `payment` MUST set `risk_level=high` and MUST NOT list
+    BA / TechLead / PM in `skip_critic`."
+  - "BA has 2 false-negatives on record — must justify skip_critic in the
+    task description before suggesting it again."
+
+Both streams pass through `ReviseHistory` dedup + regression check +
+auto-apply threshold, so noisy suggestions never ship.
 
 ## Install
 
@@ -71,6 +171,21 @@ mag --trend
 
 ## Key features
 
+- **PM router** — classifies every request into 5 kinds and dispatches a
+  sub-pipeline; PM owns the `scope` field of task metadata
+- **Task metadata** — structured JSON block per task drives all skip/run
+  decisions and powers cross-session analytics
+- **Fast-Track Critic gate** — skips Critic for PM/BA/Design/TechLead on
+  low-risk small tasks; cuts ~30–40% of Critic LLM calls
+- **Emergency Audit Mode** — any QA blocker on a skipped-Critic task auto-
+  triggers Full-Audit, records RCA, and forces Critic on for the rest of
+  the session
+- **IntegrityRules** — persistent module blacklist / keyword risk / agent
+  reputation tables that gate future skip decisions; cross-session learning
+  from false-negatives
+- **Self-evolving rules** — `integrity.md` regenerates itself after each
+  failure; RuleOptimizer merges LLM-driven and deterministic Integrity
+  suggestions
 - **Task classification** — BA outputs structured tasks with type/priority/complexity/risk/business-value
 - **Reuse-first design** — Design checks existing design system before creating new specs
 - **Resource-aware scheduling** — TechLead validates BA estimates, bin-packs tasks into sprints
@@ -86,14 +201,38 @@ mag --trend
 ```
 multi_agent/
 ├── main.py                  # CLI entry
-├── orchestrator.py          # pipeline core
-├── agents/                  # BA, Design, TechLead, Dev, QA, Critic, Investigation, RuleOptimizer, SkillDesigner
+├── orchestrator.py          # pipeline core (PM router, gates, audit mode)
+├── agents/
+│   ├── pm_agent.py          # router: 5 kinds + dispatch plan
+│   ├── ba_agent.py          # task producer (emits META blocks)
+│   ├── techlead_agent.py    # enrich_metadata + prioritize + sprint
+│   ├── design_agent.py
+│   ├── dev_agent.py
+│   ├── test_agent.py
+│   ├── critic_agent.py
+│   ├── rule_optimizer_agent.py  # LLM + suggest_from_integrity
+│   ├── skill_designer_agent.py
+│   └── investigation_agent.py
 ├── core/                    # message_bus, token_tracker, plan_detector, doctor
-├── context/                 # project_detector, scoped_reader, git_helper, health_check, output_paths, refresh
-├── learning/                # skill_selector, skill_optimizer, revise_history, score_adjuster, task_models
+├── context/                 # project_detector, scoped_reader, git_helper, health_check
+├── learning/
+│   ├── task_models.py       # Task + metadata parse/emit
+│   ├── task_metadata.py     # TaskMetadata (context/flow_control/technical_debt)
+│   ├── audit_log.py         # RCA JSONL writer + aggregator
+│   ├── integrity_rules.py   # module blacklist / keyword risk / reputation
+│   ├── skill_selector.py
+│   ├── skill_optimizer.py
+│   ├── revise_history.py
+│   └── score_adjuster.py
 ├── testing/                 # patrol_runner, maestro_runner, stitch_browser, auto_feedback
 ├── reporting/               # html_report, trend_report
 ├── rules/                   # system prompts + criteria per agent
+│   └── <profile>/
+│       ├── pm.md / ba.md / techlead.md / dev.md / test.md / ...
+│       ├── criteria/<agent>.md
+│       ├── integrity.md     # auto-generated from IntegrityRules
+│       ├── .learning/       # module_blacklist, keyword_risk, agent_reputation
+│       └── .audit/          # cross-session audit aggregate
 └── skills/                  # specialized skill files per agent × scope
 ```
 
@@ -221,13 +360,16 @@ After each pipeline run:
 
 | Trigger                                           | Action                                  |
 |---------------------------------------------------|-----------------------------------------|
-| REVISE pattern recurs ≥ 5 sessions                | Auto-apply rule/criteria change        |
-| Applied rule causes score drop ≥ 0.5 (2+ sessions)| Auto-rollback + blacklist pattern      |
-| Agent avg ≥ 8.5 for 3 consecutive sessions        | Auto-upgrade PASS_THRESHOLD +1         |
-| Skill avg < 5.0 across ≥ 5 uses                   | Auto-deprecate (if other skills exist) |
-| Skill stuck in 5-7 band across 4+ uses            | Auto-refine via shadow A/B             |
-| Chronic misfit pattern ≥ 4 sessions               | Auto-create new shadow skill           |
-| Two skills with ≥ 70% trigger overlap             | Auto-merge candidate                   |
+| REVISE pattern recurs ≥ 5 sessions                | Auto-apply rule/criteria change         |
+| Applied rule causes score drop ≥ 0.5 (2+ sessions)| Auto-rollback + blacklist pattern       |
+| Agent avg ≥ 8.5 for 3 consecutive sessions        | Auto-upgrade PASS_THRESHOLD +1          |
+| Skill avg < 5.0 across ≥ 5 uses                   | Auto-deprecate (if other skills exist)  |
+| Skill stuck in 5-7 band across 4+ uses            | Auto-refine via shadow A/B              |
+| Chronic misfit pattern ≥ 4 sessions               | Auto-create new shadow skill            |
+| Two skills with ≥ 70% trigger overlap             | Auto-merge candidate                    |
+| Module accumulates ≥ 3 post-skip failures         | `module_blacklist` → force Critic       |
+| Agent accumulates ≥ 2 false-negatives             | `agent_reputation` force-Critic window 5 |
+| Keyword appears in ≥ 1 failure blocker            | `keyword_risk` promote to med/high      |
 
 ### 5. Shadow A/B for skill evolution
 
