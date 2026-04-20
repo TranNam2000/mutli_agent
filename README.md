@@ -183,9 +183,22 @@ mag --trend
 - **IntegrityRules** — persistent module blacklist / keyword risk / agent
   reputation tables that gate future skip decisions; cross-session learning
   from false-negatives
-- **Self-evolving rules** — `integrity.md` regenerates itself after each
-  failure; RuleOptimizer merges LLM-driven and deterministic Integrity
-  suggestions
+- **RuleEvolver** — unified rule evolution loop (default ON): merges 4
+  signals (LLM analysis / IntegrityRules / user feedback / token-cost
+  trend), provenance-tags every clause, multi-dim scores each proposal,
+  and routes to auto / shadow / pending lanes
+- **Statistical shadow A/B** — ≥ 10 sessions per variant, delta must beat
+  both 1.0 absolute and 2 × pooled SEM (≈ 95% CI), plus a 7.0 quality
+  floor, plus variance ≤ 1.5 stddev — so promotions are signal, not noise
+- **Adaptive cost signal** — per (agent × scope × complexity) token
+  budget table with rolling-window trend; legitimate XL work never
+  flagged, single outliers never rewrite rules
+- **User feedback** — `mag feedback <session> --agent X --rating N
+  --comment "..."` feeds the learning loop with the highest-trust source
+- **Multi-skill per agent** — agents can activate 1..N skills (stack +
+  domain + mode). Default heuristic picker is free; opt-in LLM auto-pick
+  via `MULTI_AGENT_SKILL_LLM=1` costs ~5k tok/session for metadata-aware
+  routing
 - **Task classification** — BA outputs structured tasks with type/priority/complexity/risk/business-value
 - **Reuse-first design** — Design checks existing design system before creating new specs
 - **Resource-aware scheduling** — TechLead validates BA estimates, bin-packs tasks into sprints
@@ -193,7 +206,12 @@ mag --trend
 - **Auto-feedback loop** — Patrol + Maestro + logcat scraper + vision-diff vs design specs → self-heal BLOCKERs
 - **Maintain mode** — auto-detect project, scoped keyword-driven context, git branch per session
 - **Meta-learning** — rules and skills tune themselves over sessions: auto-apply, shadow A/B, criteria upgrade, regression rollback
-- **Skill system** — 20+ specialized skills per agent × scope (simple → feature → full_app → bug_fix), stack-specific (Flutter / React Native / Next.js)
+- **Skill system** — 30 specialized skills per agent × scope (simple → feature → full_app → bug_fix), stack-specific (Flutter / React Native / Next.js / NestJS) + domain (e-commerce) + mode (startup MVP / maintain / hotfix)
+- **TL ↔ BA feedback loops** — proactive batch review when BA spec has
+  red flags + reactive postmortem when Dev fix loops stuck on same
+  BLOCKER
+- **Context Cohesion check** — flags tasks that mention libraries not in
+  declared project deps (Firebase spec but no `firebase_core` in pubspec)
 - **HTML dashboard** — self-contained report with score trends, skill heatmap, Maestro thumbnails, feedback items
 
 ## Architecture
@@ -220,20 +238,30 @@ multi_agent/
 │   ├── task_metadata.py     # TaskMetadata (context/flow_control/technical_debt)
 │   ├── audit_log.py         # RCA JSONL writer + aggregator
 │   ├── integrity_rules.py   # module blacklist / keyword risk / reputation
-│   ├── skill_selector.py
-│   ├── skill_optimizer.py
-│   ├── revise_history.py
-│   └── score_adjuster.py
+│   ├── rule_evolver.py      # 4-source merge, provenance, multi-dim, A/B
+│   ├── skill_selector.py    # per-agent + multi-skill + LLM auto-pick
+│   ├── skill_optimizer.py   # shadow A/B for skills
+│   ├── revise_history.py    # score trend, regression detection, rollback
+│   └── score_adjuster.py    # cost + clarification + test-outcome penalties
 ├── testing/                 # patrol_runner, maestro_runner, stitch_browser, auto_feedback
 ├── reporting/               # html_report, trend_report
 ├── rules/                   # system prompts + criteria per agent
 │   └── <profile>/
 │       ├── pm.md / ba.md / techlead.md / dev.md / test.md / ...
+│       ├── <agent>.shadow.md  # rule A/B test variant (auto-managed)
+│       ├── <agent>.rejected.md # archived loser of A/B (auto-managed)
 │       ├── criteria/<agent>.md
 │       ├── integrity.md     # auto-generated from IntegrityRules
-│       ├── .learning/       # module_blacklist, keyword_risk, agent_reputation
-│       └── .audit/          # cross-session audit aggregate
-└── skills/                  # specialized skill files per agent × scope
+│       ├── .learning/
+│       │   ├── module_blacklist.json
+│       │   ├── keyword_risk.json
+│       │   ├── agent_reputation.json
+│       │   ├── cost_history.json   # per-agent rolling token ratios
+│       │   └── cost_budgets.json   # user override (optional)
+│       ├── .audit/          # cross-session audit aggregate
+│       ├── .feedback/       # mag feedback <session>.jsonl entries
+│       └── .shadow_log.json # rule A/B baseline vs shadow score log
+└── skills/                  # 30 specialized skill files per agent × scope
 ```
 
 ## Scoring mechanism
@@ -390,12 +418,24 @@ Routing by final score:
 | **shadow**  | score ∈ [0.60, 0.80)                    | Write `<agent>.shadow.md`, A/B test |
 | **pending** | score < 0.60                            | Queue for user review       |
 
-Shadow A/B:
-- Baseline vs shadow run in parallel for ≥ 2 sessions.
-- shadow − baseline ≥ +0.30 → PROMOTE (shadow replaces baseline; old
-  baseline archived as `.rejected.md`).
-- shadow − baseline ≤ −0.30 → DEMOTE (shadow deleted).
-- Otherwise → keep testing.
+Shadow A/B (rule variants) — statistical, not demo-grade:
+- Each session either loads the baseline rule or `<agent>.shadow.md`
+  (orchestrator balances samples so both variants accumulate evenly).
+- After each session the agent's average critic score is logged against
+  whichever variant it ran.
+- A verdict is only rendered when:
+  - ≥ **10 sessions per variant**
+  - Variance ≤ **1.5 stddev** in both (otherwise noise dominates)
+  - max(baseline_avg, shadow_avg) ≥ **7.0** quality floor (so promoting
+    isn't just 'less bad')
+  - Delta beats **both** 1.0 absolute AND 2 × pooled SEM (≈ 95% CI)
+- Then:
+  - shadow − baseline ≥ threshold → PROMOTE (shadow replaces baseline;
+    old baseline archived as `<agent>.rejected.md`)
+  - shadow − baseline ≤ −threshold → DEMOTE (shadow deleted)
+  - otherwise → keep testing
+- A rejected comparison carries a `reject_reason` field for audit
+  (insufficient samples / high variance / below quality floor).
 
 Classic meta-learning triggers (still active):
 
@@ -413,6 +453,30 @@ Classic meta-learning triggers (still active):
 
 Set `MULTI_AGENT_LEGACY_RULE_OPTIMIZER=1` to restore the pre-evolver
 auto-apply-on-repeat behaviour (useful only for debugging).
+
+**Adaptive cost signal** — one of the four learning inputs deserves its
+own note. Rather than a flat token threshold, the system computes an
+expected budget from the current task batch's metadata:
+
+```
+expected_tokens(agent) = Σ EXPECTED_BUDGET[(agent, task.scope, task.complexity)]
+                              for each task in the batch
+```
+
+A suggestion is emitted only when BOTH hold:
+
+1. `actual / expected ≥ 1.5×` this session
+2. ≥ 3 of the last 5 sessions also ≥ 1.5×
+
+Per-agent ratio history lives in
+`rules/<profile>/.learning/cost_history.json`. Users can override the
+defaults by writing `rules/<profile>/.learning/cost_budgets.json`
+with keys of the form `"dev|feature|XL": 50000`.
+
+Result: legitimate XL work (e.g. Dev spending 40k on a full-app task)
+is never flagged as over-budget, while an agent that consistently
+bloats S-task output across several sessions does trigger a
+"trim output" rule clause — tagged with `src=cost` provenance.
 
 ### 5. Shadow A/B for skill evolution
 
