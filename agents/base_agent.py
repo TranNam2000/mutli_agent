@@ -191,9 +191,12 @@ class BaseAgent:
     _RETRY_BASE_WAIT = 2  # seconds, doubles each attempt
 
     def _call(self, system: str, user_message: str, max_tokens: int = 4096) -> str:
-        """Call Claude Code CLI. Auth is handled by `claude` itself — we do
-        not read, strip, or forward ANTHROPIC_API_KEY. If your CLI works in a
-        terminal, it works here."""
+        """Call Claude Code CLI. Auth is handled by `claude` itself.
+
+        One mechanical step: we strip ANTHROPIC_API_KEY from the subprocess
+        env ONLY (user's shell env is untouched) so a stale/invalid key
+        never wins over the logged-in Claude Code session.
+        """
         system_text = self._build_system(system)
 
         # Rate-limit: acquire semaphore + enforce min spacing between call starts
@@ -234,10 +237,13 @@ class BaseAgent:
                 argv = list(primary_argv)
                 argv[argv.index(None)] = tmp.name   # inject tmp path
 
+                clean_env = {k: v for k, v in os.environ.items()
+                               if k != "ANTHROPIC_API_KEY"}
                 result = subprocess.run(
                     argv,
                     capture_output=True,
                     text=True,
+                    env=clean_env,
                     timeout=600,
                 )
                 if result.returncode != 0:
@@ -306,12 +312,14 @@ class BaseAgent:
             tmp.write(system_text)
             tmp.flush()
             tmp.close()
+            clean_env = {k: v for k, v in os.environ.items()
+                           if k != "ANTHROPIC_API_KEY"}
             result = subprocess.run(
                 ["claude", "-p", user_message,
                  "--system-prompt-file", tmp.name,
                  "--image", str(img),
                  "--output-format", "text", "--bare"],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, env=clean_env, timeout=300,
             )
             if result.returncode != 0:
                 err = (result.stderr or "").strip() or (result.stdout or "").strip()
