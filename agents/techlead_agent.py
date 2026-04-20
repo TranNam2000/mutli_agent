@@ -3,6 +3,61 @@ from __future__ import annotations
 from .base_agent import BaseAgent
 
 
+# Libraries/services BA might mention in a task. Each entry maps
+#   trigger_phrase → list of package-dependency tokens we expect to see in
+#   project_context when this library is actually installed. If the task
+#   text contains the trigger but NONE of the tokens appear in the project
+#   context, that's a Context-Cohesion red flag: BA probably assumed a
+#   library that does not exist in the codebase yet.
+#
+# Add-only: new entries are safe; stale/missing entries just reduce coverage.
+_COHESION_LIBS: dict[str, list[str]] = {
+    # ── Flutter ──────────────────────────────────────────────────────────────
+    "firebase":            ["firebase_core", "firebase:"],
+    "firebase auth":       ["firebase_auth"],
+    "firebase analytics":  ["firebase_analytics"],
+    "firestore":           ["cloud_firestore"],
+    "hive":                ["hive", "hive_flutter"],
+    "isar":                ["isar", "isar_flutter_libs"],
+    "drift":               ["drift"],
+    "dio":                 ["dio:"],
+    "retrofit":            ["retrofit:"],
+    "go_router":           ["go_router"],
+    "auto_route":          ["auto_route"],
+    "bloc":                ["flutter_bloc", "bloc:"],
+    "cubit":               ["flutter_bloc", "bloc:"],
+    "riverpod":            ["flutter_riverpod", "riverpod:"],
+    "provider":            ["provider:"],
+    "get_it":              ["get_it"],
+    "injectable":          ["injectable"],
+    "shared_preferences":  ["shared_preferences"],
+    "secure storage":      ["flutter_secure_storage"],
+    "google sign":         ["google_sign_in"],
+    "apple sign":          ["sign_in_with_apple"],
+    "facebook login":      ["flutter_facebook_auth"],
+    # ── Payment ──────────────────────────────────────────────────────────────
+    "stripe":              ["flutter_stripe", "stripe:"],
+    "vnpay":               ["vnpay"],
+    "momo":                ["momo"],
+    "paypal":              ["paypal"],
+    # ── Analytics ────────────────────────────────────────────────────────────
+    "amplitude":           ["amplitude_flutter"],
+    "mixpanel":            ["mixpanel_flutter"],
+    "segment":             ["segment"],
+    "sentry":              ["sentry_flutter", "sentry:"],
+    "crashlytics":         ["firebase_crashlytics"],
+    # ── React Native ─────────────────────────────────────────────────────────
+    "react navigation":    ["@react-navigation"],
+    "redux":               ["@reduxjs/toolkit", "react-redux"],
+    "async-storage":       ["@react-native-async-storage/async-storage"],
+    # ── Next.js ──────────────────────────────────────────────────────────────
+    "next-auth":           ["next-auth"],
+    "prisma":              ["@prisma/client", "prisma:"],
+    "trpc":                ["@trpc/"],
+    "tailwind":            ["tailwindcss"],
+}
+
+
 # Module keywords used by enrich_metadata() to derive impact_area.
 _IMPACT_KEYWORDS = {
     "payment":           ["payment", "checkout", "stripe", "vnpay", "momo", "paypal"],
@@ -98,8 +153,7 @@ class TechLeadAgent(BaseAgent):
         self._apply_ba_clarifications(tasks, answer)
         return {"flagged": flagged, "question": question, "answer": answer}
 
-    @staticmethod
-    def _smell_test_spec(task) -> list[str]:
+    def _smell_test_spec(self, task) -> list[str]:
         """Regex-only red-flag detector. Zero LLM cost."""
         flags: list[str] = []
         desc = (task.description or "").lower()
@@ -124,7 +178,42 @@ class TechLeadAgent(BaseAgent):
                 flags.append("core-area + complexity L/XL")
             if m.context.scope == "hotfix" and ac_n == 0:
                 flags.append("hotfix không có AC")
+
+        # ── Context cohesion: does the task mention libraries/services that
+        #    don't exist in the project's declared dependencies?
+        project_ctx = getattr(self, "project_context", "") or ""
+        if project_ctx:
+            for trigger, missing in self._cohesion_missing(task, project_ctx).items():
+                flags.append(
+                    f"mentions `{trigger}` but project has no "
+                    f"{missing[0]} in deps — is BA introducing it?"
+                )
         return flags
+
+    @staticmethod
+    def _cohesion_missing(task, project_ctx: str) -> dict[str, list[str]]:
+        """
+        Return {trigger_phrase: expected_tokens} for each library the task
+        mentions but whose dependency is missing from project_context.
+        Runs only on tasks that have a project context (maintain mode).
+        """
+        hay_task = " ".join([
+            task.title or "", task.description or "",
+            " ".join(task.acceptance_criteria or []),
+        ]).lower()
+        hay_ctx = project_ctx.lower()
+        missing: dict[str, list[str]] = {}
+        for trigger, tokens in _COHESION_LIBS.items():
+            # Word-boundary match to avoid "firebase" matching "firebaseauth"
+            # but still match "firebase" in "use firebase for auth".
+            import re as _re
+            if not _re.search(rf"\b{_re.escape(trigger)}\b", hay_task):
+                continue
+            # If ANY expected token is present in project context → OK.
+            if any(tok.lower() in hay_ctx for tok in tokens):
+                continue
+            missing[trigger] = tokens
+        return missing
 
     @staticmethod
     def _format_batch_question(flagged: list[dict]) -> str:
