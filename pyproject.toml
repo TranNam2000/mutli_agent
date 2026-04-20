@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-pipeline"
+version = "0.2.0"
+description = "Multi-agent product development pipeline (BA → Design ∥ TechLead → Dev → QA) with self-improving skills, Patrol/Maestro testing, and auto-feedback."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Trần", email = "tranhoainamnb1312@gmail.com"}]
+keywords = ["ai-agents", "flutter", "claude", "testing", "patrol", "maestro"]
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "playwright>=1.40.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+multi-agent = "main:main"
+
+[tool.setuptools]
+# Treat this flat layout as a single package named "multi_agent"
+packages = [
+    "multi_agent",
+    "multi_agent.agents",
+    "multi_agent.core",
+    "multi_agent.context",
+    "multi_agent.learning",
+    "multi_agent.testing",
+    "multi_agent.reporting",
+]
+
+[tool.setuptools.package-dir]
+"multi_agent" = "."
+"multi_agent.agents" = "agents"
+"multi_agent.core" = "core"
+"multi_agent.context" = "context"
+"multi_agent.learning" = "learning"
+"multi_agent.testing" = "testing"
+"multi_agent.reporting" = "reporting"
+
+[tool.setuptools.package-data]
+"multi_agent" = ["rules/**/*.md", "skills/**/*.md"]

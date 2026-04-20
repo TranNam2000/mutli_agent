@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Pipeline outputs (generated per session)
+outputs/
+.multi_agent/
+
+# Rule/skill backup dirs (auto-created when optimizer rewrites)
+rules/backups/
+skills/.backups/
+skills/.skill_history.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.log
+*.tmp
+tmp/
