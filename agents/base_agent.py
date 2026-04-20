@@ -194,7 +194,13 @@ class BaseAgent:
         import tempfile
         system_text = self._build_system(system)
         env = {**os.environ}
-        env.pop("ANTHROPIC_API_KEY", None)
+        # Previously this line stripped ANTHROPIC_API_KEY to force Claude Code's
+        # OAuth session. That breaks in Claude Code 2.1+ where the session is
+        # managed separately from the env. We now preserve the full env — if the
+        # user wants to prefer subscription auth they can explicitly
+        # `unset ANTHROPIC_API_KEY` in their shell.
+        if os.environ.get("MULTI_AGENT_STRIP_API_KEY", "0") == "1":
+            env.pop("ANTHROPIC_API_KEY", None)
 
         # Rate-limit: acquire semaphore + enforce min spacing between call starts
         _CALL_SEMAPHORE.acquire()
