@@ -76,6 +76,8 @@ class Suggestion:
     multi_dim:       float = 0.0
     lane:            str   = ""                # "auto" | "shadow" | "pending"
     timestamp:       str   = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    # Pre-rendered full rule content for diff preview; lazily populated.
+    suggested_rule:  str   = ""
 
     def provenance_tag(self) -> str:
         """Inline HTML comment tagging source for audit."""
@@ -450,23 +452,51 @@ class RuleEvolver:
         {f"{agent_key}:{target_type}": existing content} for consistency check."""
         for s in suggestions:
             key = f"{s.agent_key}:{s.target_type}"
-            compute_multi_dim(s, current_rules.get(key, ""))
+            current = current_rules.get(key, "")
+            compute_multi_dim(s, current)
             assign_lane(s)
+            # Pre-render the full rule content so apply() can diff it.
+            if not s.suggested_rule:
+                s.suggested_rule = (
+                    current + ("\n\n" if current else "")
+                    + s.provenance_tag() + "\n" + s.addition.rstrip() + "\n"
+                )
         # Sort: auto first (apply), then shadow (A/B), then pending.
         priority = {"auto": 0, "shadow": 1, "pending": 2}
         suggestions.sort(key=lambda s: (priority[s.lane], -s.multi_dim))
         return suggestions
 
     def apply(self, suggestions: list[Suggestion],
-               rule_path_resolver) -> dict:
+               rule_path_resolver, confirm: bool | None = None) -> dict:
         """Execute: write auto to baseline, write shadow to <agent>.shadow.md.
+
         `rule_path_resolver(agent_key, target_type) -> Path` tells us where to
-        write. Returns {"applied": [...], "shadowed": [...], "pending": [...]}.
+        write. When `confirm=True` (or env MULTI_AGENT_RULE_CONFIRM=1 and
+        stdout is a TTY) every auto-apply shows a unified diff + Y/n prompt.
+
+        Returns {"applied": [...], "shadowed": [...], "pending": [...], "skipped": [...]}.
         """
-        out = {"applied": [], "shadowed": [], "pending": []}
+        import os as _os, sys as _sys
+        if confirm is None:
+            confirm = (
+                _os.environ.get("MULTI_AGENT_RULE_CONFIRM", "0") == "1"
+                and _sys.stdout.isatty()
+            )
+        out = {"applied": [], "shadowed": [], "pending": [], "skipped": []}
         for s in suggestions:
             path = rule_path_resolver(s.agent_key, s.target_type)
             if s.lane == "auto":
+                if confirm:
+                    try:
+                        from core.ux import show_diff_and_confirm
+                    except ImportError:
+                        show_diff_and_confirm = None
+                    if show_diff_and_confirm is not None:
+                        approved = show_diff_and_confirm(path, s.suggested_rule,
+                                                           auto_yes=False)
+                        if not approved:
+                            out["skipped"].append(asdict(s))
+                            continue
                 write_provenance_addition(path, s)
                 out["applied"].append(asdict(s))
             elif s.lane == "shadow":

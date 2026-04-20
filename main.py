@@ -201,10 +201,55 @@ def _run_ui_review(screenshot: str, session_id: str, profile: str = "default"):
 
 
 def main():
+    # Load .mag.yaml before anything else so env vars are in place.
+    try:
+        from core.ux import load_config
+        load_config()
+    except Exception:
+        pass
+
     # ── --doctor (environment check) ─────────────────────────────────────────
     if "--doctor" in sys.argv:
         from core.doctor import main as doctor_main
         doctor_main()
+        return
+
+    # ── status [--profile X] : health snapshot ─────────────────────────────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "status":
+        from core.ux import status_report
+        profile = _get_arg("--profile") or "default"
+        print(status_report(profile))
+        return
+
+    # ── undo <session_id> [--profile X] : revert rule changes ──────────────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "undo":
+        from core.ux import undo_session
+        session_id = sys.argv[2] if len(sys.argv) >= 3 else _get_arg("--session") or ""
+        profile    = _get_arg("--profile") or "default"
+        if not session_id:
+            print("❌ Usage: mag undo <session_id> [--profile default]")
+            sys.exit(1)
+        result = undo_session(session_id, profile)
+        if result["restored"]:
+            print(f"✅ Restored {len(result['restored'])} rule file(s):")
+            for p in result["restored"]:
+                print(f"   • {p}")
+            print(f"   Window: {result['window']}")
+        else:
+            print(f"⚠️  Nothing restored. Reason: {result['missing'][0]}")
+        return
+
+    # ── chat : interactive multi-turn mode ──────────────────────────────────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "chat":
+        from core.ux import chat_loop
+        from orchestrator import ProductDevelopmentOrchestrator
+
+        def _run(task, resources):
+            budget = detect_budget()
+            orch = ProductDevelopmentOrchestrator(token_budget=budget)
+            orch.run(task, resources=resources)
+
+        chat_loop(_run)
         return
 
     # ── feedback <session_id> --agent X --rating N --comment "..." ───────────
