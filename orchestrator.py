@@ -676,6 +676,58 @@ class ProductDevelopmentOrchestrator:
 
         return entries
 
+    # ── PM is the authority on `scope` ───────────────────────────────────────
+
+    # PM.kind → canonical TaskMetadata.context.scope value.
+    _PM_KIND_TO_SCOPE = {
+        "feature":       "feature",
+        "bug_fix":       "bug_fix",
+        "ui_tweak":      "ui_tweak",
+        "refactor":      "refactor",
+        "hotfix":        "hotfix",
+        "investigation": "investigation",
+    }
+
+    def _apply_pm_metadata(self, route, tasks: list) -> int:
+        """
+        PM is the **single source of truth** for `scope`. After BA parses
+        tasks, we overwrite `metadata.context.scope` to match PM's kind so
+        downstream gates, audit log and analytics always agree with PM.
+
+        If PM decomposed the request into sub_tasks, we match each sub_task
+        description against task titles (case-insensitive substring) and
+        apply that sub_task's kind specifically; tasks with no match inherit
+        the top-level kind.
+
+        Returns: number of tasks whose metadata was overwritten.
+        """
+        if route is None or not tasks:
+            return 0
+        default_scope = self._PM_KIND_TO_SCOPE.get(route.kind, route.kind)
+        sub_tasks = list(getattr(route, "sub_tasks", []) or [])
+
+        def _match_sub(task) -> str | None:
+            """Try to map this task to one of PM's sub_tasks via title match."""
+            if not sub_tasks:
+                return None
+            hay = (task.title or "").lower() + " " + (task.description or "").lower()
+            for st in sub_tasks:
+                desc = (st.get("desc") or "").lower()
+                if desc and desc[:30] in hay:
+                    return self._PM_KIND_TO_SCOPE.get(st.get("kind"), st.get("kind"))
+            return None
+
+        changed = 0
+        for t in tasks:
+            m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            if m is None:
+                continue
+            chosen = _match_sub(t) or default_scope
+            if m.context.scope != chosen:
+                m.context.scope = chosen
+                changed += 1
+        return changed
+
     def _fast_track_announce(self, key: str, context: dict) -> None:
         """Print a human-readable 'Fast-Track' message explaining why Critic
         was skipped for this step. Uses metadata in context when available."""
@@ -1064,7 +1116,8 @@ class ProductDevelopmentOrchestrator:
 
     def _run_task_based_pipeline(self, product_idea: str,
                                   resources: dict | None = None,
-                                  allowed_steps: list[str] | None = None) -> dict:
+                                  allowed_steps: list[str] | None = None,
+                                  pm_route: "RouteDecision | None" = None) -> dict:
         """
         New flow:
           1. BA.produce_tasks → classified task list (ui/logic/bug/hotfix/mixed)
@@ -1138,6 +1191,13 @@ class ProductDevelopmentOrchestrator:
             tasks, _links = expand_mixed_tasks(tasks)
             tprint(f"\n  ✂️  Split {mixed_count} mixed tasks → {mixed_count*2} children "
                    f"(UI blocking Logic)")
+
+        # PM is authoritative for `scope` — override any BA-written value so
+        # downstream gates / audit log / RuleOptimizer all agree with PM.
+        pm_stamped = self._apply_pm_metadata(pm_route, tasks)
+        if pm_stamped:
+            tprint(f"  🧭 PM stamped scope on {pm_stamped}/{len(tasks)} task(s) "
+                   f"(kind=`{pm_route.kind}`)")
 
         tprint(f"\n  📋 Parsed {len(tasks)} tasks from BA:")
         split = split_by_type(tasks)
@@ -1350,6 +1410,7 @@ class ProductDevelopmentOrchestrator:
             product_idea,
             resources=resources,
             allowed_steps=route.dispatch_steps(),
+            pm_route=route,
         )
 
         self._apply_outcome_adjustments(product_idea)
