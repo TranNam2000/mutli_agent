@@ -42,8 +42,13 @@ from pathlib import Path
 AUTO_APPLY_THRESHOLD   = 0.80
 SHADOW_THRESHOLD       = 0.60
 AUTO_APPLY_CONSENSUS   = 3         # number of distinct sources that must agree
-SHADOW_MIN_SESSIONS    = 2         # min sessions before shadow can promote
-SHADOW_PROMOTE_DELTA   = 0.30      # shadow must beat baseline by this much
+# Statistical shadow A/B thresholds — tightened from demo-grade to sample-
+# safe values. Promote/demote requires sufficient evidence, not just a
+# difference in sample means.
+SHADOW_MIN_SESSIONS    = 10        # sample size per variant before we judge
+SHADOW_PROMOTE_DELTA   = 1.0       # absolute delta in critic score (0-10)
+SHADOW_MIN_QUALITY     = 7.0       # max(avg_b, avg_s) must clear this floor
+SHADOW_MAX_STDDEV      = 1.5       # variance above this → treat as unreliable
 
 
 # Provenance source identifiers.
@@ -256,25 +261,64 @@ class ShadowLog:
         self._flush()
 
     def verdicts(self) -> list[dict]:
-        """Return list of shadow entries ready for promote/demote decision."""
+        """Return list of shadow entries ready for promote/demote decision.
+
+        Verdict requires ALL of:
+          1. Enough samples per variant (≥ SHADOW_MIN_SESSIONS each).
+          2. Variance in each variant below SHADOW_MAX_STDDEV (otherwise the
+             comparison is noise-dominated and we keep testing).
+          3. Quality floor — at least one variant clears SHADOW_MIN_QUALITY;
+             otherwise both are bad, promoting "less bad" is pointless.
+          4. Delta beats BOTH (a) absolute SHADOW_PROMOTE_DELTA AND (b)
+             2 × pooled SEM (≈ 95% CI proxy), so we don't promote noise.
+        """
+        import math
         out = []
         for key, v in self._data["variants"].items():
-            b = v.get("baseline", [])
-            s = v.get("shadow", [])
-            if len(b) < SHADOW_MIN_SESSIONS or len(s) < SHADOW_MIN_SESSIONS:
+            b_scores = [x["score"] for x in v.get("baseline", [])]
+            s_scores = [x["score"] for x in v.get("shadow",   [])]
+            if len(b_scores) < SHADOW_MIN_SESSIONS or len(s_scores) < SHADOW_MIN_SESSIONS:
                 continue
-            avg_b = sum(x["score"] for x in b) / len(b)
-            avg_s = sum(x["score"] for x in s) / len(s)
+
+            avg_b = sum(b_scores) / len(b_scores)
+            avg_s = sum(s_scores) / len(s_scores)
             delta = avg_s - avg_b
-            if delta >= SHADOW_PROMOTE_DELTA:
+
+            # Variance — sample stddev (n-1 denominator).
+            def _stddev(vals, mu):
+                if len(vals) < 2:
+                    return 0.0
+                return math.sqrt(sum((x - mu) ** 2 for x in vals) / (len(vals) - 1))
+            std_b = _stddev(b_scores, avg_b)
+            std_s = _stddev(s_scores, avg_s)
+
+            # Rejection conditions for reliability.
+            reject_reason = None
+            if std_b > SHADOW_MAX_STDDEV or std_s > SHADOW_MAX_STDDEV:
+                reject_reason = f"variance too high (std_b={std_b:.2f}, std_s={std_s:.2f})"
+            elif max(avg_b, avg_s) < SHADOW_MIN_QUALITY:
+                reject_reason = f"both variants below quality floor ({max(avg_b, avg_s):.2f} < {SHADOW_MIN_QUALITY})"
+
+            # Significance check (Welch-style 2×SEM).
+            sem_pooled = math.sqrt(std_b ** 2 / len(b_scores) + std_s ** 2 / len(s_scores))
+            sig_threshold = max(SHADOW_PROMOTE_DELTA, 2.0 * sem_pooled)
+
+            if reject_reason:
+                verdict = "continue"
+            elif delta >= sig_threshold:
                 verdict = "promote"
-            elif delta <= -SHADOW_PROMOTE_DELTA:
+            elif delta <= -sig_threshold:
                 verdict = "demote"
             else:
                 verdict = "continue"
+
             out.append({
                 "key": key, "verdict": verdict,
-                "baseline_avg": avg_b, "shadow_avg": avg_s, "delta": delta,
+                "baseline_avg": avg_b, "shadow_avg": avg_s,
+                "baseline_std": std_b, "shadow_std": std_s,
+                "delta": delta, "sig_threshold": sig_threshold,
+                "reject_reason": reject_reason,
+                "n_baseline": len(b_scores), "n_shadow": len(s_scores),
                 "variant": v,
             })
         return out

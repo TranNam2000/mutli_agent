@@ -1259,6 +1259,9 @@ class ProductDevelopmentOrchestrator:
             tprint(f"  🧭 PM stamped scope on {pm_stamped}/{len(tasks)} task(s) "
                    f"(kind=`{pm_route.kind}`)")
 
+        # Stash for the end-of-session cost-signal calculation.
+        self._current_tasks_for_cost = list(tasks)
+
         tprint(f"\n  📋 Parsed {len(tasks)} tasks from BA:")
         split = split_by_type(tasks)
         tprint(f"     UI: {len(split['ui'])}  Logic: {len(split['logic'])}  "
@@ -1829,19 +1832,126 @@ class ProductDevelopmentOrchestrator:
             shadow_log.log_run(agent_key, "rule", variant, avg, self.session_id)
             tprint(f"  📊 Shadow log: [{agent_key}] {variant}={avg:.2f}")
 
+    # Per-(agent, scope, complexity) token budgets — picked from empirical
+    # rule-of-thumb observations: BA summaries are small, Dev/Test outputs
+    # grow with complexity. These are defaults; users can override via
+    # rules/<profile>/.learning/cost_budgets.json.
+    _COST_BUDGETS_DEFAULT = {
+        # (agent_key, scope,     complexity) → expected tokens for 1 task
+        ("ba",       "feature",  "S"): 1500,
+        ("ba",       "feature",  "M"): 3000,
+        ("ba",       "feature",  "L"): 6000,
+        ("ba",       "feature",  "XL"): 12000,
+        ("ba",       "bug_fix",  "S"): 800,
+        ("ba",       "bug_fix",  "M"): 1500,
+        ("ba",       "hotfix",   "S"): 600,
+        ("ba",       "ui_tweak", "S"): 700,
+        ("ba",       "refactor", "M"): 2500,
+        ("design",   "feature",  "S"): 1500,
+        ("design",   "feature",  "M"): 3000,
+        ("design",   "feature",  "L"): 6000,
+        ("design",   "feature",  "XL"): 10000,
+        ("design",   "ui_tweak", "S"): 600,
+        ("techlead", "feature",  "S"): 2000,
+        ("techlead", "feature",  "M"): 4000,
+        ("techlead", "feature",  "L"): 8000,
+        ("techlead", "feature",  "XL"): 14000,
+        ("techlead", "refactor", "M"): 3500,
+        ("dev",      "feature",  "S"): 3000,
+        ("dev",      "feature",  "M"): 8000,
+        ("dev",      "feature",  "L"): 18000,
+        ("dev",      "feature",  "XL"): 40000,
+        ("dev",      "bug_fix",  "S"): 2000,
+        ("dev",      "bug_fix",  "M"): 4500,
+        ("dev",      "hotfix",   "S"): 1500,
+        ("dev",      "ui_tweak", "S"): 1200,
+        ("dev",      "refactor", "M"): 6000,
+        ("test",     "feature",  "S"): 2000,
+        ("test",     "feature",  "M"): 5000,
+        ("test",     "feature",  "L"): 12000,
+        ("test",     "feature",  "XL"): 25000,
+        ("test",     "bug_fix",  "S"): 1200,
+        ("test",     "hotfix",   "S"): 800,
+    }
+    _COST_FALLBACK = 5000                   # used when key missing from table
+    _COST_RATIO_OVER_BUDGET = 1.5           # current ratio ≥ this → "over"
+    _COST_TREND_WINDOW = 5                  # look at last N sessions
+    _COST_TREND_REQUIRED_OVER = 3           # need ≥ this many overs to emit
+
+    def _load_cost_history(self) -> dict:
+        """Load per-agent cost ratio history from
+        rules/<profile>/.learning/cost_history.json."""
+        import json
+        from agents.base_agent import _RULES_DIR
+        path = _RULES_DIR / self.profile / ".learning" / "cost_history.json"
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_cost_history(self, history: dict) -> None:
+        import json
+        from agents.base_agent import _RULES_DIR
+        path = _RULES_DIR / self.profile / ".learning" / "cost_history.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(history, indent=2, ensure_ascii=False),
+                         encoding="utf-8")
+
+    def _load_cost_budgets(self) -> dict:
+        """User override file (optional) merges over _COST_BUDGETS_DEFAULT."""
+        import json
+        from agents.base_agent import _RULES_DIR
+        path = _RULES_DIR / self.profile / ".learning" / "cost_budgets.json"
+        budgets = dict(self._COST_BUDGETS_DEFAULT)
+        if path.exists():
+            try:
+                user = json.loads(path.read_text(encoding="utf-8"))
+                for k, v in user.items():
+                    parts = k.split("|")
+                    if len(parts) == 3:
+                        budgets[(parts[0], parts[1], parts[2])] = int(v)
+            except Exception:
+                pass
+        return budgets
+
+    def _expected_budget_for_tasks(self, tasks: list,
+                                     budgets: dict) -> dict:
+        """Sum expected tokens per agent given the current task batch."""
+        totals: dict[str, int] = {}
+        for t in tasks or []:
+            try:
+                m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            except Exception:
+                m = None
+            scope      = (m.context.scope      if m else "feature")
+            complexity = (m.context.complexity if m else "M")
+            for agent_key in ("ba", "design", "techlead", "dev", "test"):
+                exp = budgets.get((agent_key, scope, complexity),
+                                    self._COST_FALLBACK)
+                totals[agent_key] = totals.get(agent_key, 0) + exp
+        return totals
+
     def _build_cost_suggestions(self) -> list:
-        """Emit cost-driven rule suggestions for agents that over-consumed
-        tokens this session. Returns list[Suggestion]."""
+        """Emit cost-driven rule suggestions ONLY when an agent is reliably
+        over budget across a trend window.
+
+        Triggers require BOTH:
+          (a) Current-session ratio ≥ _COST_RATIO_OVER_BUDGET (1.5×)
+          (b) ≥ _COST_TREND_REQUIRED_OVER sessions in the last
+              _COST_TREND_WINDOW were also ≥ ratio threshold
+
+        Expected budget per agent is derived from metadata (scope +
+        complexity of the current tasks), not a flat constant. Legitimate
+        XL work is therefore not flagged as over-budget.
+        """
         from learning.rule_evolver import Suggestion, SRC_COST
         tracker = getattr(self, "tokens", None)
         if tracker is None or not tracker.records:
             return []
-        # Threshold: configurable via env, default 20k tokens/agent/session.
-        try:
-            threshold = int(os.environ.get("MULTI_AGENT_COST_RULE_THRESHOLD", "20000"))
-        except ValueError:
-            threshold = 20000
-        by_agent: dict[str, int] = {}
+
+        # Actual spend per agent this session.
         role_to_key = {
             "Business Analyst (BA)": "ba",
             "UI/UX Designer":        "design",
@@ -1850,30 +1960,62 @@ class ProductDevelopmentOrchestrator:
             "QA/Tester":              "test",
             "Project Manager (PM)":  "pm",
         }
+        actual: dict[str, int] = {}
         for rec in tracker.records:
             key = role_to_key.get(rec.agent, rec.agent.lower())
-            by_agent[key] = by_agent.get(key, 0) + rec.total
+            actual[key] = actual.get(key, 0) + rec.total
+
+        # Expected spend from task metadata.
+        tasks = getattr(self, "_current_tasks_for_cost", None) or []
+        budgets  = self._load_cost_budgets()
+        expected = self._expected_budget_for_tasks(tasks, budgets)
+
+        # Load and update history.
+        history  = self._load_cost_history()
+
         out: list = []
-        for agent_key, total in by_agent.items():
-            if total < threshold:
+        for agent_key, spent in actual.items():
+            exp = expected.get(agent_key, self._COST_FALLBACK)
+            if exp <= 0:
                 continue
-            pct = (total / threshold) * 100
+            ratio = spent / exp
+
+            # Append to history (per-agent rolling window).
+            ratios = history.setdefault(agent_key, [])
+            ratios.append(round(ratio, 3))
+            # Keep last N + a buffer for audit.
+            if len(ratios) > self._COST_TREND_WINDOW * 2:
+                history[agent_key] = ratios[-self._COST_TREND_WINDOW * 2:]
+
+            # Gate 1: current session must be over budget.
+            if ratio < self._COST_RATIO_OVER_BUDGET:
+                continue
+
+            # Gate 2: trend — N/M recent sessions over.
+            recent = ratios[-self._COST_TREND_WINDOW:]
+            n_over = sum(1 for r in recent if r >= self._COST_RATIO_OVER_BUDGET)
+            if n_over < self._COST_TREND_REQUIRED_OVER:
+                continue
+
             addition = (
-                f"- Cost discipline: this agent consumed {total:,} tokens "
-                f"last session ({pct:.0f}% of the {threshold:,} budget). "
-                "Trim future outputs — avoid repeating boilerplate, omit "
-                "sections the caller already has, summarise instead of "
-                "restating."
+                f"- Cost trend: `{agent_key}` ran at {ratio * 100:.0f}% of "
+                f"expected budget this session ({spent:,} / {exp:,} tokens). "
+                f"Over budget in {n_over}/{len(recent)} of recent sessions. "
+                "Trim output to essentials — omit boilerplate, summarise "
+                "instead of restating, cut examples to one canonical case."
             )
             out.append(Suggestion(
                 agent_key=agent_key, target_type="rule",
                 addition=addition,
-                reason=f"Token cost {total:,} > threshold {threshold:,}",
+                reason=(f"Cost trend {n_over}/{len(recent)} over "
+                        f"{self._COST_RATIO_OVER_BUDGET:.1f}× budget"),
                 sources=[SRC_COST],
                 session_id=self.session_id,
                 score_cost=0.9,
-                score_correctness=0.55,  # cost is real but weaker than user/integrity
+                score_correctness=0.55,
             ))
+
+        self._save_cost_history(history)
         return out
 
     def _run_rule_evolver(self, raw_suggestions: list[dict], history):
