@@ -2,23 +2,23 @@
 PASS_THRESHOLD: 8
 WEIGHTS: completeness=0.35 format=0.20 quality=0.45
 
-## Completeness (có enough no)
-- [ ] Test strategy có scope + risk areas
-- [ ] Ít nhất 3 happy path + 3 edge/negative cases mỗi feature
-- [ ] Test cases có enough: precondition + steps + expected result
-- [ ] Performance test scenarios có target numbers (P50/P95/P99)
-- [ ] Security checklist ít nhất 5 items liên quan đến feature cụ can
-- [ ] Exit criteria có number liệu cụ can (pass rate, bug count)
+## Completeness (what must exist)
+- [ ] Test strategy with scope + risk areas
+- [ ] At least 3 happy path + 3 edge/negative cases per feature
+- [ ] Test cases contain: precondition + steps + expected result
+- [ ] Performance test scenarios with target numbers (P50/P95/P99)
+- [ ] Security checklist with ≥ 5 items tied to this specific feature
+- [ ] Exit criteria with concrete numbers (pass rate, bug count)
 
-## Format (đúng cấu trúc no)
-- [ ] Test cases use table: TC-ID | Title | Precondition | Steps | Expected | Priority | Type
-- [ ] Priority use P1/P2/P3/P4
-- [ ] Bug report template đầy enough các field
-- [ ] Test levels phân chia rõ: Unit / Integration / System / UAT
+## Format (structure)
+- [ ] Test cases in table: TC-ID | Title | Precondition | Steps | Expected | Priority | Type
+- [ ] Priority uses P1/P2/P3/P4
+- [ ] Bug report template with full fields
+- [ ] Test levels labeled: Unit / Integration / System / UAT
 
-## Quality (sâu and hữu ích no)
-- [ ] Edge cases cover boundary values thực sự (no chỉ "null input")
-- [ ] Negative cases phản ánh real user mistakes
-- [ ] Performance targets có number liệu cụ can
-- [ ] Security test liên quan trực tiếp đến feature, no copy-paste OWASP chung chung
-- [ ] Automation candidates có lý do cụ can tại why phù hợp
+## Quality (depth / usefulness)
+- [ ] Edge cases cover real boundary values (not just "null input")
+- [ ] Negative cases reflect real user mistakes
+- [ ] Performance targets with concrete numbers
+- [ ] Security tests tied to this feature, not copy-pasted OWASP generic
+- [ ] Automation candidates justified with why each is suitable

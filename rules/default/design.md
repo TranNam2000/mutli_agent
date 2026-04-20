@@ -2,21 +2,21 @@
 PASS_THRESHOLD: 7
 WEIGHTS: completeness=0.35 format=0.25 quality=0.40
 
-## Completeness (có enough no)
-- [ ] Design System có: colors (hex), typography, spacing, border radius
-- [ ] Wireframe for ít nhất 3 màn hình chính
-- [ ] Mỗi wireframe có enough states: loading / empty / error / success
-- [ ] User Flow from entry đến exit
-- [ ] Component specs có dimensions + states
+## Completeness (what must exist)
+- [ ] Design System has: colors (hex), typography, spacing, border radius
+- [ ] Wireframe for at least 3 main screens
+- [ ] Each wireframe has all states: loading / empty / error / success
+- [ ] User flow from entry to exit
+- [ ] Component specs with dimensions + states
 
-## Format (đúng cấu trúc no)
-- [ ] Colors có name + hex + usage context
-- [ ] Wireframe use ASCII layout có border rõ ràng
-- [ ] Navigation ghi rõ "from đâu → đi đâu"
-- [ ] Component states liệt kê đầy enough
+## Format (structure)
+- [ ] Colors listed with name + hex + usage context
+- [ ] Wireframe uses ASCII layout with clear borders
+- [ ] Navigation explicit: "from X → to Y"
+- [ ] Component states enumerated fully
 
-## Quality (sâu and hữu ích no)
-- [ ] Design system enough to Dev implement no need hỏi thêm màu/size
-- [ ] Wireframe enough rõ layout, no chỉ is placeholder text
-- [ ] Empty state and error state is thiết kế (no skip)
-- [ ] Touch targets trông enough lớn (≥ 44pt)
+## Quality (depth / usefulness)
+- [ ] Design system enough for Dev to implement without asking for colors/sizes
+- [ ] Wireframe conveys real layout, not just placeholder text
+- [ ] Empty state and error state designed (not skipped)
+- [ ] Touch targets visibly large enough (≥ 44pt)

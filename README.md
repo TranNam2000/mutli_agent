@@ -82,6 +82,126 @@ multi_agent/
 └── skills/                  # specialized skill files per agent × scope
 ```
 
+## Scoring mechanism
+
+Every agent output goes through 5 layers of evaluation that feed into
+self-improving rules and skills.
+
+### 1. Critic checklist (per-step)
+
+After each agent produces an output, the Critic grades it against the skill's
+criteria file using **3 levels** (not binary YES/NO):
+
+| Grade       | Value | Meaning                                                     |
+|-------------|-------|-------------------------------------------------------------|
+| **FULL**    | 1.0   | Fully done, good quality                                    |
+| **PARTIAL** | 0.5   | Done but incomplete / shallow (≥ 50% but < 100%)            |
+| **MISS**    | 0.0   | Fully missing or wrong                                      |
+
+Each criteria file (`rules/<profile>/criteria/<agent>.md`) defines:
+
+```
+PASS_THRESHOLD: 7
+WEIGHTS: completeness=0.40 format=0.20 quality=0.40
+
+## Completeness (what must exist)
+- [ ] item 1
+- [ ] item 2
+
+## Format (structure rules)
+- [ ] item A
+
+## Quality (depth / usefulness)
+- [ ] item X
+```
+
+**Score calculation:**
+
+```
+dim_score = sum(grades) / total_items × 10        # per dimension
+final     = floor(c × Wc + f × Wf + q × Wq)
+verdict   = PASS if final ≥ PASS_THRESHOLD else REVISE
+```
+
+**Auto-penalties (override scoring):**
+- `MISSING_INFO` still in output → quality capped at 4
+- Output < 200 chars → quality capped at 3
+
+**Revise loop:** if REVISE, the agent gets `revision_guide` and retries up to
+2 rounds. After 2 failed rounds → escalation prompt [Continue / Retry / Skip].
+
+### 2. Task priority score (during planning)
+
+In the task-based flow, BA produces tasks that are scored for scheduling:
+
+```
+priority_score = priority_weight × business_value_boost × risk_multiplier / √hours
+```
+
+| Field            | Values & multiplier                                          |
+|------------------|--------------------------------------------------------------|
+| priority         | P0=10, P1=6, P2=3, P3=1                                     |
+| business_value   | critical=1.8, high=1.3, normal=1.0, low=0.6                 |
+| risk             | low=1.0, med=1.3, high=1.7                                  |
+| complexity hours | S=3, M=8, L=18, XL=40                                       |
+
+Higher score → earlier in sprint. Dependencies enforced via topological order.
+
+### 3. Score adjuster (post-pipeline reality check)
+
+Critic score can be gamed by checklist-satisfying output. The `ScoreAdjuster`
+blends critic score with real outcomes:
+
+- Patrol / Maestro test fails → penalty on Dev / Design
+- Downstream agent asks many clarifications → penalty on upstream
+- `MISSING_INFO` leaks into next step → penalty on the producer
+- Token usage wildly exceeds expected → penalty on all agents
+
+**Dynamic weights per scope:**
+
+| Scope      | completeness | format | quality |
+|------------|--------------|--------|---------|
+| simple     | 0.30         | 0.30   | 0.40    |
+| bug_fix    | 0.25         | 0.15   | 0.60    |
+| feature    | 0.35         | 0.20   | 0.45    |
+| module     | 0.40         | 0.20   | 0.40    |
+| full_app   | 0.45         | 0.15   | 0.40    |
+
+### 4. Meta-learning triggers (cross-session)
+
+After each pipeline run:
+
+| Trigger                                           | Action                                  |
+|---------------------------------------------------|-----------------------------------------|
+| REVISE pattern recurs ≥ 5 sessions                | Auto-apply rule/criteria change        |
+| Applied rule causes score drop ≥ 0.5 (2+ sessions)| Auto-rollback + blacklist pattern      |
+| Agent avg ≥ 8.5 for 3 consecutive sessions        | Auto-upgrade PASS_THRESHOLD +1         |
+| Skill avg < 5.0 across ≥ 5 uses                   | Auto-deprecate (if other skills exist) |
+| Skill stuck in 5-7 band across 4+ uses            | Auto-refine via shadow A/B             |
+| Chronic misfit pattern ≥ 4 sessions               | Auto-create new shadow skill           |
+| Two skills with ≥ 70% trigger overlap             | Auto-merge candidate                   |
+
+### 5. Shadow A/B for skill evolution
+
+New or refined skills don't replace parents immediately:
+
+```
+Shadow skill created → used for ≥ 2 sessions in parallel with parent
+ → compare avg score
+   shadow - parent ≥ +0.5 → PROMOTE  (shadow replaces parent)
+   shadow - parent < 0.5  → DEMOTE   (shadow retired to .rejected.md)
+```
+
+### Grading view
+
+Each session writes `.multi_agent/sessions/<id>/REPORT.html` with:
+
+- Sparkline per agent showing score trend
+- Radar chart: completeness / format / quality
+- Top failed checklist items with evidence
+- Skill usage heatmap
+- `--trend` generates a cross-session `TREND.html` aggregating all above
+
 ## Environment variables (optional)
 
 ```bash

@@ -17,9 +17,9 @@ When reviewing, ask yourself:
 
 ## 3-level grading
 
-- **FULL**    —  done fully, good quality (1.0 điểm)
-- **PARTIAL** — done but incomplete/shallow, ≥ 50% but < 100% of requirement (0.5 điểm)
-- **MISS**    — fully missing or done wrong (0.0 điểm)
+- **FULL**    — done fully, good quality (1.0 point)
+- **PARTIAL** — done but incomplete/shallow, ≥ 50% but < 100% of requirement (0.5 point)
+- **MISS**    — fully missing or done wrong (0.0 point)
 
 Rule when unsure FULL vs PARTIAL:
 - Has the main sections listed but each is shallow → PARTIAL
