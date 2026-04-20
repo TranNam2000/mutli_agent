@@ -182,7 +182,7 @@ def llm_pick_skill(call_fn, agent_key: str, task: str, candidates: list[dict]) -
     """
     When heuristics are ambiguous, ask the model directly.
     call_fn(system, user, max_tokens) -> str — same signature as BaseAgent._call.
-    Returns the forsen skill_key.
+    Returns the chosen skill_key.
     """
     options = "\n".join(
         f"- {s['skill_key']}: scope={s['scope']}  triggers={s['triggers'][:4]}"
@@ -203,6 +203,118 @@ def llm_pick_skill(call_fn, agent_key: str, task: str, candidates: list[dict]) -
     return candidates[0]["skill_key"]
 
 
+def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
+                           candidates: list[dict], max_n: int = 2) -> list[str]:
+    """
+    Ask Claude to pick 1..max_n complementary skills. Used by LLM-auto mode
+    (env MULTI_AGENT_SKILL_LLM=1). Returns skill_keys in priority order.
+
+    Strategy: tell the model to pick at most `max_n` and prefer picking 1
+    unless the task genuinely spans two orthogonal concerns (e.g. stack +
+    domain). Fallback: first candidate.
+    """
+    options = "\n".join(
+        f"- {s['skill_key']}: scope={s['scope']}  triggers={', '.join(s['triggers'][:5])}"
+        for s in candidates
+    )
+    system = (
+        f"You là agent {agent_key}. Với task sau, chọn TỪ 1 ĐẾN {max_n} skill "
+        f"để kết hợp. Chỉ chọn >1 khi task thực sự chạm nhiều concern độc lập "
+        f"(stack + domain, stack + mode, v.v.). Trả lời gọn:\n"
+        f"SKILLS: skill_key_1, skill_key_2"
+    )
+    user = f"Task:\n{task[:600]}\n\nSkills có sẵn:\n{options}"
+    try:
+        raw = call_fn(system, user, max_tokens=100)
+        import re as _re
+        m = _re.search(r"SKILLS:\s*(.+)", raw, _re.IGNORECASE)
+        names_line = m.group(1) if m else raw
+        picked: list[str] = []
+        valid = {s["skill_key"] for s in candidates}
+        for part in _re.split(r"[,;\n]", names_line):
+            key = part.strip().strip("`").strip("'\"")
+            if key in valid and key not in picked:
+                picked.append(key)
+            if len(picked) >= max_n:
+                break
+        if picked:
+            return picked
+    except Exception:
+        pass
+    return [candidates[0]["skill_key"]] if candidates else []
+
+
+# ── Multi-skill selection ────────────────────────────────────────────────────
+
+def select_skills(agent_key: str, task: str, project_context: str = "",
+                   scope_hint: str | None = None, llm_fallback=None,
+                   max_n: int = 2, llm_auto: bool = False) -> list[dict]:
+    """
+    Return 1..max_n skills to activate for this agent+task.
+
+    Modes:
+      llm_auto=False (default): heuristic scoring; secondary kept only if
+        score ≥ 70% of primary.
+      llm_auto=True: always ask Claude to pick 1..max_n skills (requires
+        llm_fallback to be a call function, not None).
+    """
+    scope = scope_hint or detect_scope(task, project_context)
+    all_skills = list_skills(agent_key)
+    if not all_skills:
+        return []
+
+    matching = [s for s in all_skills if scope in s["scope"] or not s["scope"]]
+    if not matching:
+        matching = all_skills
+
+    text = task.lower() + " " + project_context[:2000].lower()
+    scored: list[tuple[int, dict]] = []
+    for skill in matching:
+        score = 0
+        for trigger in skill["triggers"]:
+            if trigger in text:
+                score += len(trigger.split()) + 1
+        if scope in skill["scope"]:
+            score += 2
+        scored.append((score, skill))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # ── LLM-auto mode: hand the top candidates to Claude and honour its pick
+    if llm_auto and llm_fallback and len(scored) >= 1:
+        candidates = [s for _, s in scored[: max(max_n + 1, 3)]]
+        picked_keys = llm_fallback("multi", agent_key, task, candidates, max_n)
+        picked: list[dict] = []
+        for key in picked_keys:
+            for _, s in scored:
+                if s["skill_key"] == key and s not in picked:
+                    s["detected_scope"]   = scope
+                    s["selection_method"] = "llm_auto"
+                    s["rank"]             = len(picked) + 1
+                    picked.append(s)
+                    break
+        if picked:
+            return picked
+
+    # ── Heuristic mode — primary + optional secondary
+    if not scored:
+        return []
+    primary_score, primary = scored[0]
+    primary["detected_scope"]   = scope
+    primary["selection_method"] = "keyword"
+    primary["rank"]             = 1
+    result = [primary]
+
+    if max_n >= 2 and len(scored) >= 2 and primary_score > 0:
+        second_score, second = scored[1]
+        if second_score >= primary_score * 0.7 and second["skill_key"] != primary["skill_key"]:
+            second["detected_scope"]   = scope
+            second["selection_method"] = "keyword_secondary"
+            second["rank"]             = 2
+            result.append(second)
+
+    return result
+
+
 def render_skill(skill: dict, base_rule: str) -> str:
     """Combine base rule + skill-specific instructions into final system prompt."""
     if not skill:
@@ -213,3 +325,39 @@ def render_skill(skill: dict, base_rule: str) -> str:
         f"## 🎯 ACTIVE SKILL: {skill['skill_key']} (scope: {skill.get('detected_scope', '?')})\n\n"
         f"{skill['content']}"
     )
+
+
+def render_skills(skills: list[dict], base_rule: str) -> str:
+    """Merge 1..N skills into a single system prompt. Order = priority rank.
+
+    When multiple skills are given, each one gets its own labelled section
+    and a header notes the combination so the model can reason about
+    potential conflicts.
+    """
+    if not skills:
+        return base_rule
+    if len(skills) == 1:
+        return render_skill(skills[0], base_rule)
+
+    keys = " + ".join(s["skill_key"] for s in skills)
+    parts = [
+        base_rule,
+        "",
+        "---",
+        "",
+        f"## 🎯 ACTIVE SKILLS (combined): {keys}",
+        "",
+        "When skill guidance conflicts, the PRIMARY skill takes precedence "
+        "over secondary ones. Apply all non-conflicting rules from every "
+        "active skill.",
+        "",
+    ]
+    for idx, s in enumerate(skills, 1):
+        label = "PRIMARY" if idx == 1 else f"SECONDARY #{idx-1}"
+        parts += [
+            f"### {label} — {s['skill_key']} (scope: {s.get('detected_scope','?')})",
+            "",
+            s["content"],
+            "",
+        ]
+    return "\n".join(parts)

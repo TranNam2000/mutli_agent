@@ -50,55 +50,105 @@ class BaseAgent:
         self._system_prompt: str = ""
         self.project_context: str = ""  # set by orchestrator when --maintain
         self._current_step: str = ""   # set by orchestrator before each step
-        self._active_skill: dict | None = None  # set by detect_skill()
+        # Multi-skill support. `_active_skills` is the canonical state;
+        # the legacy `_active_skill` attribute is a back-compat shim for any
+        # caller that still reads the single-skill API.
+        self._active_skills: list[dict] = []
         self._skill_usage_log: list[dict] = []  # for skill optimizer
+
+    @property
+    def _active_skill(self) -> dict | None:
+        """Back-compat alias — primary (rank=1) skill, or None."""
+        return self._active_skills[0] if self._active_skills else None
+
+    @_active_skill.setter
+    def _active_skill(self, value: dict | None) -> None:
+        self._active_skills = [value] if value else []
 
     @property
     def system_prompt(self) -> str:
         """Load from rules/<profile>/<RULE_KEY>.md, fallback to default. Reloads every call.
-        If an active skill is set, merge skill content into system prompt."""
+        If any active skill(s) are set, merge their content into system prompt."""
         base = _load_rule(self.RULE_KEY, self.profile) if self.RULE_KEY else self._system_prompt
-        if self._active_skill:
+        if self._active_skills:
             try:
-                from learning.skill_selector import render_skill
-                return render_skill(self._active_skill, base)
+                from learning.skill_selector import render_skills
+                return render_skills(self._active_skills, base)
             except Exception:
                 return base
         return base
 
     def detect_skill(self, task: str, scope_hint: str | None = None) -> dict | None:
-        """Auto-select best skill for this task. Falls back to LLM when heuristics ambiguous."""
+        """Auto-select best skill for this task. Falls back to LLM when heuristics ambiguous.
+
+        Environment controls:
+          MULTI_AGENT_SKILL_LLM=1  → always ask Claude to pick 1..MAX skills
+                                      (opt-in; costs ~800 tok/agent × steps).
+          MULTI_AGENT_SKILL_MAX=2  → cap on number of active skills per agent
+                                      (default 2; 1 disables multi-skill).
+
+        Returns the PRIMARY skill for back-compat with existing callers;
+        the full list is available via `self._active_skills`.
+        """
         if not self.SKILL_KEY:
             return None
         try:
-            from learning.skill_selector import select_skill, llm_pick_skill
+            from learning.skill_selector import (
+                select_skills, llm_pick_skill, llm_pick_skills_multi,
+            )
         except ImportError:
             return None
 
-        def _llm(key, t, candidates):
+        llm_auto = os.environ.get("MULTI_AGENT_SKILL_LLM", "0") == "1"
+        try:
+            max_n = int(os.environ.get("MULTI_AGENT_SKILL_MAX", "2"))
+        except ValueError:
+            max_n = 2
+        max_n = max(1, min(3, max_n))
+
+        def _llm_single(key, t, candidates):
             return llm_pick_skill(self._call, key, t, candidates)
 
-        skill = select_skill(
+        def _llm_multi(_mode, agent_key, t, candidates, m):
+            return llm_pick_skills_multi(self._call, agent_key, t, candidates, m)
+
+        fallback = _llm_multi if llm_auto else _llm_single
+        skills = select_skills(
             self.SKILL_KEY,
             task=task,
             project_context=self.project_context,
             scope_hint=scope_hint,
-            llm_fallback=_llm,
+            llm_fallback=fallback,
+            max_n=max_n,
+            llm_auto=llm_auto,
         )
-        if skill:
-            self._active_skill = skill
+        if not skills:
+            return None
+
+        self._active_skills = skills
+        for s in skills:
             self._skill_usage_log.append({
-                "step":    self._current_step,
-                "skill":   skill["skill_key"],
-                "scope":   skill.get("detected_scope"),
-                "method":  skill.get("selection_method"),
+                "step":   self._current_step,
+                "skill":  s["skill_key"],
+                "scope":  s.get("detected_scope"),
+                "method": s.get("selection_method"),
+                "rank":   s.get("rank", 1),
             })
-            print(f"  🎯 [{self.ROLE}] skill: {skill['skill_key']}  scope={skill.get('detected_scope')}  via={skill.get('selection_method')}")
-        return skill
+
+        if len(skills) == 1:
+            s = skills[0]
+            print(f"  🎯 [{self.ROLE}] skill: {s['skill_key']}  "
+                  f"scope={s.get('detected_scope')}  via={s.get('selection_method')}")
+        else:
+            names = " + ".join(s["skill_key"] for s in skills)
+            method = skills[0].get("selection_method", "?")
+            print(f"  🎯 [{self.ROLE}] skills: {names}  "
+                  f"scope={skills[0].get('detected_scope')}  via={method}")
+        return skills[0]
 
     def clear_skill(self):
-        """Reset active skill (e.g. between independent tasks)."""
-        self._active_skill = None
+        """Reset active skills (e.g. between independent tasks)."""
+        self._active_skills = []
 
     def _build_system(self, system: str) -> str:
         """Prepend project context to system prompt when available."""
