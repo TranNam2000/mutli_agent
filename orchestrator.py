@@ -1466,6 +1466,9 @@ class ProductDevelopmentOrchestrator:
         if not self.maintain_mode:
             self._detect_maintain_from_task(product_idea)
 
+        # ── Activate rule A/B variants (shadow vs baseline) if any are live
+        self._activate_rule_variants()
+
         # ── PM router runs BEFORE BA clarification so Investigation kind
         #    can skip the heavy clarification gate.
         route = self._run_pm_router(product_idea)
@@ -1496,6 +1499,7 @@ class ProductDevelopmentOrchestrator:
         )
 
         self._apply_outcome_adjustments(product_idea)
+        self._log_shadow_rule_scores()
         self._run_rule_optimizer()
         self._run_skill_optimizer()
         return self.results
@@ -1763,6 +1767,115 @@ class ProductDevelopmentOrchestrator:
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
+    def _activate_rule_variants(self):
+        """At session start, pick baseline vs shadow variant for each agent
+        that has a live rule A/B test. Deterministic per session (session_id
+        hashed), alternates so baseline and shadow both accumulate samples.
+        """
+        from learning.rule_evolver import ShadowLog
+        from agents.base_agent import _RULES_DIR
+        import hashlib
+        shadow_log = ShadowLog(_RULES_DIR / self.profile)
+        variants = shadow_log._data.get("variants", {}) if hasattr(shadow_log, "_data") else {}
+        if not variants:
+            return
+        seed = int(hashlib.md5(self.session_id.encode("utf-8")).hexdigest()[:8], 16)
+        for variant_key, info in variants.items():
+            agent_key, target_type = variant_key.split(":", 1)
+            if target_type != "rule":
+                continue  # only baseline prompt has a shadow variant mechanism
+            agent = self.agents.get(agent_key)
+            if agent is None:
+                continue
+            # Alternate: use run counts so both sides are sampled evenly.
+            n_base   = len(info.get("baseline", []))
+            n_shadow = len(info.get("shadow",   []))
+            if n_shadow < n_base:
+                pick = "shadow"
+            elif n_base < n_shadow:
+                pick = "baseline"
+            else:
+                pick = "shadow" if (seed & 1) else "baseline"
+            agent._rule_variant = pick
+            tprint(f"  🧪 [{agent_key}] rule A/B: loading {pick}")
+
+    def _log_shadow_rule_scores(self):
+        """After session, log average score per agent into ShadowLog for
+        whichever variant that agent was running. Prereq for verdicts()
+        to decide promote / demote next time."""
+        from learning.rule_evolver import ShadowLog
+        from agents.base_agent import _RULES_DIR
+        if not getattr(self, "critic_reviews", None):
+            return
+        shadow_log = ShadowLog(_RULES_DIR / self.profile)
+        variants = shadow_log._data.get("variants", {})
+        if not variants:
+            return
+        scores_by_agent: dict[str, list[float]] = {}
+        for r in self.critic_reviews:
+            key = r.get("agent_key", "")
+            if key and r.get("score") is not None:
+                scores_by_agent.setdefault(key, []).append(float(r["score"]))
+        for variant_key, _info in variants.items():
+            agent_key, target_type = variant_key.split(":", 1)
+            if target_type != "rule":
+                continue
+            scores = scores_by_agent.get(agent_key, [])
+            if not scores:
+                continue
+            avg = sum(scores) / len(scores)
+            agent = self.agents.get(agent_key)
+            variant = getattr(agent, "_rule_variant", "baseline") if agent else "baseline"
+            shadow_log.log_run(agent_key, "rule", variant, avg, self.session_id)
+            tprint(f"  📊 Shadow log: [{agent_key}] {variant}={avg:.2f}")
+
+    def _build_cost_suggestions(self) -> list:
+        """Emit cost-driven rule suggestions for agents that over-consumed
+        tokens this session. Returns list[Suggestion]."""
+        from learning.rule_evolver import Suggestion, SRC_COST
+        tracker = getattr(self, "tokens", None)
+        if tracker is None or not tracker.records:
+            return []
+        # Threshold: configurable via env, default 20k tokens/agent/session.
+        try:
+            threshold = int(os.environ.get("MULTI_AGENT_COST_RULE_THRESHOLD", "20000"))
+        except ValueError:
+            threshold = 20000
+        by_agent: dict[str, int] = {}
+        role_to_key = {
+            "Business Analyst (BA)": "ba",
+            "UI/UX Designer":        "design",
+            "Tech Lead":             "techlead",
+            "Developer":              "dev",
+            "QA/Tester":              "test",
+            "Project Manager (PM)":  "pm",
+        }
+        for rec in tracker.records:
+            key = role_to_key.get(rec.agent, rec.agent.lower())
+            by_agent[key] = by_agent.get(key, 0) + rec.total
+        out: list = []
+        for agent_key, total in by_agent.items():
+            if total < threshold:
+                continue
+            pct = (total / threshold) * 100
+            addition = (
+                f"- Cost discipline: this agent consumed {total:,} tokens "
+                f"last session ({pct:.0f}% of the {threshold:,} budget). "
+                "Trim future outputs — avoid repeating boilerplate, omit "
+                "sections the caller already has, summarise instead of "
+                "restating."
+            )
+            out.append(Suggestion(
+                agent_key=agent_key, target_type="rule",
+                addition=addition,
+                reason=f"Token cost {total:,} > threshold {threshold:,}",
+                sources=[SRC_COST],
+                session_id=self.session_id,
+                score_cost=0.9,
+                score_correctness=0.55,  # cost is real but weaker than user/integrity
+            ))
+        return out
+
     def _run_rule_evolver(self, raw_suggestions: list[dict], history):
         """Product/enterprise rule evolution: provenance + multi-dim + A/B.
 
@@ -1788,9 +1901,13 @@ class ProductDevelopmentOrchestrator:
             else:
                 llm_raw.append(s)
 
+        cost_sugs = self._build_cost_suggestions()
+        if cost_sugs:
+            tprint(f"  💰 Cost signal: {len(cost_sugs)} agent(s) over token budget")
         merged = evolver.gather(
             llm_suggestions=llm_raw,
             integrity_suggestions=integrity_raw,
+            cost_suggestions=cost_sugs,
         )
         if not merged:
             tprint("  RuleEvolver: no signals → skip this session.")

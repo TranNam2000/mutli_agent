@@ -55,6 +55,10 @@ class BaseAgent:
         # caller that still reads the single-skill API.
         self._active_skills: list[dict] = []
         self._skill_usage_log: list[dict] = []  # for skill optimizer
+        # Rule A/B variant: orchestrator sets to "shadow" when this session
+        # should evaluate rules/<profile>/<agent>.shadow.md instead of the
+        # baseline <agent>.md. Default "baseline".
+        self._rule_variant: str = "baseline"
 
     @property
     def _active_skill(self) -> dict | None:
@@ -65,11 +69,29 @@ class BaseAgent:
     def _active_skill(self, value: dict | None) -> None:
         self._active_skills = [value] if value else []
 
+    def _load_effective_rule(self) -> str:
+        """Load the rule file, honouring shadow A/B variant when active.
+
+        When `_rule_variant == "shadow"` and `<RULE_KEY>.shadow.md` exists
+        in the active profile, load that file instead of the baseline. The
+        orchestrator flips the variant per session (session_id parity) so
+        ShadowLog can compare the two side by side.
+        """
+        if not self.RULE_KEY:
+            return self._system_prompt
+        if self._rule_variant == "shadow":
+            for p in [self.profile, "default"]:
+                shadow_path = _RULES_DIR / p / f"{self.RULE_KEY}.shadow.md"
+                if shadow_path.exists():
+                    return shadow_path.read_text(encoding="utf-8").strip()
+        return _load_rule(self.RULE_KEY, self.profile)
+
     @property
     def system_prompt(self) -> str:
-        """Load from rules/<profile>/<RULE_KEY>.md, fallback to default. Reloads every call.
-        If any active skill(s) are set, merge their content into system prompt."""
-        base = _load_rule(self.RULE_KEY, self.profile) if self.RULE_KEY else self._system_prompt
+        """Load from rules/<profile>/<RULE_KEY>.md (or .shadow.md when active);
+        reloads every call. If any active skill(s) are set, merge their content
+        into system prompt."""
+        base = self._load_effective_rule()
         if self._active_skills:
             try:
                 from learning.skill_selector import render_skills
