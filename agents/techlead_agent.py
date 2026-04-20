@@ -63,6 +63,129 @@ class TechLeadAgent(BaseAgent):
 
         return updated
 
+    # ── Option B: batch-review BA spec proactively ───────────────────────────
+
+    def review_ba_spec_batch(self, ba_agent, tasks: list) -> dict:
+        """
+        Scan BA output for ambiguous tasks (regex smell test). If any red
+        flag is found, ask BA ONCE with a consolidated list of clarifications
+        and patch the answer back into the affected tasks' descriptions.
+
+        Returns:
+          {"flagged": [...], "question": str, "answer": str}  when BA was asked
+          {"flagged": []}                                     when nothing to ask
+        """
+        flagged: list[dict] = []
+        for t in tasks or []:
+            flags = self._smell_test_spec(t)
+            if flags:
+                flagged.append({
+                    "id":    t.id,
+                    "title": (t.title or "").strip()[:80],
+                    "flags": flags,
+                })
+        if not flagged:
+            return {"flagged": []}
+
+        question = self._format_batch_question(flagged)
+        try:
+            answer = self.ask(ba_agent, question)
+        except Exception as e:
+            return {"flagged": flagged, "question": question,
+                    "answer": f"(ask failed: {e})"}
+
+        # Patch each flagged task with BA's clarifications.
+        self._apply_ba_clarifications(tasks, answer)
+        return {"flagged": flagged, "question": question, "answer": answer}
+
+    @staticmethod
+    def _smell_test_spec(task) -> list[str]:
+        """Regex-only red-flag detector. Zero LLM cost."""
+        flags: list[str] = []
+        desc = (task.description or "").lower()
+        ac_n = len(task.acceptance_criteria or [])
+        if ac_n < 2:
+            flags.append(f"AC chỉ có {ac_n} mục")
+        if len(task.description or "") < 80:
+            flags.append("description ngắn (<80 chars)")
+        if "missing_info" in desc:
+            flags.append("còn MISSING_INFO")
+        for vague in ("as usual", "should work", "works normally",
+                       "standard behavior", "như thường"):
+            if vague in desc:
+                flags.append(f"phrasing mơ hồ: '{vague}'")
+                break
+        try:
+            m = task.get_metadata() if hasattr(task, "get_metadata") else None
+        except Exception:
+            m = None
+        if m is not None:
+            if m.touches_core() and m.context.complexity in ("L", "XL"):
+                flags.append("core-area + complexity L/XL")
+            if m.context.scope == "hotfix" and ac_n == 0:
+                flags.append("hotfix không có AC")
+        return flags
+
+    @staticmethod
+    def _format_batch_question(flagged: list[dict]) -> str:
+        """Build one consolidated question TL → BA."""
+        lines = [
+            "Tôi là Tech Lead. Trước khi prioritize + giao cho Dev, một số "
+            "task sau có spec chưa đủ rõ. Vui lòng bổ sung AC hoặc clarify:",
+            "",
+        ]
+        for item in flagged[:6]:
+            lines.append(f"### {item['id']} — {item['title']}")
+            lines.append(f"  Red flags: {', '.join(item['flags'])}")
+            lines.append("")
+        lines += [
+            "Trả lời format:",
+            "",
+            "CLARIFY TASK-XXX:",
+            "- AC: GIVEN ... WHEN ... THEN ...",
+            "- Edge case: ...",
+            "",
+            "Nếu task đã đầy đủ, ghi: CLARIFY TASK-XXX: OK",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _apply_ba_clarifications(tasks: list, answer: str) -> int:
+        """Parse BA answer, append new AC / edge-case lines to matching tasks."""
+        import re as _re
+        pattern = _re.compile(
+            r"CLARIFY\s+(TASK-[\w\-]+)\s*:\s*(.+?)(?=\n\s*CLARIFY\s+TASK-|\Z)",
+            _re.DOTALL | _re.IGNORECASE,
+        )
+        patched = 0
+        for m in pattern.finditer(answer):
+            tid, body = m.group(1), m.group(2).strip()
+            if body.upper().startswith("OK"):
+                continue
+            task = next((t for t in tasks if t.id == tid), None)
+            if task is None:
+                continue
+            # Append extra AC lines preserved from BA's answer.
+            extra_ac: list[str] = []
+            for line in body.splitlines():
+                s = line.strip().lstrip("-* ").strip()
+                if s.lower().startswith("ac:"):
+                    s = s[3:].strip()
+                if not s:
+                    continue
+                if s.lower().startswith("edge case:"):
+                    s = s[10:].strip()
+                    extra_ac.append(f"Edge: {s}")
+                else:
+                    extra_ac.append(s)
+            if extra_ac:
+                task.acceptance_criteria = list(task.acceptance_criteria or []) + extra_ac
+                # Also append a note in description so downstream sees the patch.
+                note = "\n\n[TL clarified via BA]: " + "; ".join(extra_ac[:2])
+                task.description = (task.description or "") + note
+                patched += 1
+        return patched
+
     # ── Task-based flow ───────────────────────────────────────────────────────
 
     def prioritize_and_assign(self, tasks: list, resources: dict | None = None) -> dict:

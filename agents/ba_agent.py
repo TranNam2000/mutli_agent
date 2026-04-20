@@ -356,6 +356,43 @@ Metadata rules:
             i += 1
         return "\n".join(updated)
 
+    def revise_specs(self, current_tasks_md: str, postmortem: str,
+                       stuck_task_ids: list[str] | None = None) -> str:
+        """
+        Option C — spec postmortem. Called when Dev+QA have looped ≥ 2 rounds
+        on the same BLOCKER. TL has asked BA to reflect; this method rewrites
+        ONLY the affected tasks' specs with extra AC / edge-cases based on the
+        postmortem. Other tasks are preserved untouched.
+
+        Args:
+          current_tasks_md: current ba.md content (the whole task list)
+          postmortem: BA's answer to TL's postmortem question
+          stuck_task_ids: tasks that are known to be stuck (hint for BA)
+
+        Returns: full revised ba.md content — replaces self.results['ba'].
+        """
+        stuck = ", ".join(stuck_task_ids or [])
+        prompt = f"""You are BA. QA + Dev are stuck on some tasks after 2 revise rounds.
+Tech Lead's postmortem summary:
+
+{postmortem}
+
+Affected task IDs (if known): {stuck or "(unknown — infer from postmortem)"}
+
+=== CURRENT FULL TASK LIST ===
+{current_tasks_md}
+
+Rewrite the FULL task list with the following rules:
+- For tasks mentioned in the postmortem: add missing AC, call out edge cases,
+  tighten description. Keep `## TASK-XXX | ...` header format intact.
+- For other tasks: keep EXACTLY as-is (do not touch).
+- Preserve any ```json META``` blocks except you MAY bump `risk_level` to
+  `high` on the affected task(s).
+- Never delete tasks.
+
+Return the revised ba.md content only — no prose around it."""
+        return self._call(self.system_prompt, prompt, max_tokens=6000)
+
     def revise_with_answers(self, original_output: str, resolved: dict[str, str], original_prompt: str) -> str:
         """Revise BA output after when có answer for MISSING_INFO — tổng hợp sạch, phân cấp rõ."""
         answers_text = "\n".join(f"- {info}: {ans}" for info, ans in resolved.items())

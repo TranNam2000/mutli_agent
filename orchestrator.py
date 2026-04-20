@@ -1260,6 +1260,24 @@ class ProductDevelopmentOrchestrator:
                 changed = tl.enrich_metadata(tasks)
                 if changed:
                     tprint(f"  🧠 TechLead enriched metadata on {changed} task(s)")
+
+            # Option B — proactive spec review. Only fires when the regex
+            # smell test flags at least one task, so spec-clean sessions
+            # pay zero tokens. If BA answers, task ACs are patched in place
+            # so downstream Dev/Test see the clarified spec.
+            if hasattr(tl, "review_ba_spec_batch"):
+                try:
+                    review = tl.review_ba_spec_batch(ba, tasks)
+                    flagged = review.get("flagged") or []
+                    if flagged:
+                        tprint(f"  🗣  TL batch-reviewed BA spec: "
+                               f"{len(flagged)} task(s) clarified via BA.")
+                        # Update BA checkpoint so resume sees patched tasks.
+                        self.results["ba"] = "\n\n".join(t.to_markdown() for t in tasks)
+                        self._save("ba", self.results["ba"])
+                except Exception as e:
+                    tprint(f"  ⚠️  TL batch review failed: {e}")
+
             result = tl.prioritize_and_assign(tasks, resources)
             sprint_plan = result["sprint_plan"]
             sprint_md = result["summary_markdown"]
@@ -2185,6 +2203,68 @@ class ProductDevelopmentOrchestrator:
 
     # ── QA → TechLead → Dev fix loop ─────────────────────────────────────────
 
+    def _option_c_spec_postmortem(self, tl, ba, dev,
+                                    blockers: list[str], tasks: list,
+                                    implementation: str, product_idea: str) -> bool:
+        """
+        Option C — when Dev fix is stuck (same BLOCKER 2 rounds in a row), TL
+        asks BA to reflect on whether the spec itself was incomplete. BA
+        rewrites the affected tasks, Dev re-implements from the refined spec.
+
+        Returns True if spec was actually refined and Dev re-ran; False if
+        nothing useful came back and the caller should escalate.
+        """
+        self._dialogue_header("TL → BA spec postmortem (stuck loop)")
+
+        stuck_ids = [t.id for t in (tasks or [])][:5]
+        question = (
+            "Dev + QA đã stuck 2 vòng fix với các BLOCKER lặp lại:\n\n"
+            + "\n".join(f"- {b[:120]}" for b in blockers[:4])
+            + f"\n\nTask liên quan (suy luận): {', '.join(stuck_ids) or '(không rõ)'}"
+            + "\n\nSpec gốc có thiếu AC, edge case, hoặc business rule nào không?"
+            + " Nếu có, nêu cụ thể — TL sẽ nhờ bạn viết lại spec."
+        )
+        try:
+            ba_reflection = tl.ask(ba, question)
+        except Exception as e:
+            tprint(f"  ⚠️  TL → BA postmortem failed: {e}")
+            return False
+
+        if not ba_reflection or len(ba_reflection) < 40:
+            tprint("  ℹ️  BA reflection too short — nothing to act on.")
+            return False
+
+        # Ask BA to rewrite the full task list with the postmortem applied.
+        current_ba_md = self.results.get("ba", "")
+        if not current_ba_md:
+            return False
+        if not hasattr(ba, "revise_specs"):
+            return False
+        try:
+            new_ba_md = ba.revise_specs(current_ba_md, ba_reflection, stuck_ids)
+        except Exception as e:
+            tprint(f"  ⚠️  BA.revise_specs failed: {e}")
+            return False
+        if not new_ba_md or new_ba_md.strip() == current_ba_md.strip():
+            tprint("  ℹ️  BA returned no meaningful changes — stopping postmortem.")
+            return False
+
+        # Persist the refined spec — resume/audit will see it.
+        self.results["ba"] = new_ba_md
+        self._save("ba", new_ba_md)
+        tprint(f"  🔁 BA rewrote spec for stuck tasks — Dev re-implementing")
+
+        # Dev re-implements using the refined spec as the fix guide.
+        fix_guide = [
+            "Spec was refined by BA after postmortem — re-implement the "
+            "affected tasks per the NEW AC + edge cases below:",
+            ba_reflection[:800],
+        ]
+        new_impl = dev.revise(implementation, fix_guide, product_idea)
+        self._save("dev", new_impl)
+        self.results["dev"] = new_impl
+        return True
+
     def _qa_dev_loop(
         self,
         qa, dev, tl,
@@ -2228,12 +2308,23 @@ class ProductDevelopmentOrchestrator:
 
             # Detect no progress: same blockers as previous round
             current_set = set(b[:80] for b in blockers)
+            spec_rescued = False
             if current_set == prev_blocker_set:
-                tprint(f"\n  ⚠️  BLOCKERs unchanged after round {round_num} — manual intervention needed.")
-                answer = input("  Keep trying to fix? [y/N] ").strip().lower()
-                if answer != "y":
-                    tprint("  ⏹  Stopping loop — BLOCKERs unresolved.")
-                    break
+                # ── Option C — TL asks BA to reflect on spec before giving up.
+                # Only fires once per session to avoid a BA ↔ TL chatter loop.
+                if not getattr(self, "_ba_postmortem_fired", False):
+                    spec_rescued = self._option_c_spec_postmortem(
+                        tl, self.agents["ba"], dev, blockers, audit_tasks,
+                        implementation, product_idea,
+                    )
+                    self._ba_postmortem_fired = True
+                if not spec_rescued:
+                    tprint(f"\n  ⚠️  BLOCKERs unchanged after round {round_num} — "
+                           f"manual intervention needed.")
+                    answer = input("  Keep trying to fix? [y/N] ").strip().lower()
+                    if answer != "y":
+                        tprint("  ⏹  Stopping loop — BLOCKERs unresolved.")
+                        break
             prev_blocker_set = current_set
 
             if not self._check_quota(f"QA→TechLead→Dev fix round {round_num}"):
