@@ -1934,11 +1934,13 @@ class ProductDevelopmentOrchestrator:
                    f"deterministic rule suggestion(s) (no LLM cost)")
             suggestions = list(suggestions or []) + integrity_suggestions
 
-        # ── RuleEvolver (opt-in via MULTI_AGENT_RULE_EVOLVER=1) ─────────────
-        # Merges LLM + Integrity + User Feedback + Cost signals, scores each
-        # suggestion along 4 dimensions, routes to auto-apply / shadow A/B /
-        # pending lanes, and evaluates existing shadows for promote/demote.
-        if os.environ.get("MULTI_AGENT_RULE_EVOLVER", "0") == "1":
+        # ── Learning system: unified rule evolution (default ON) ─────────────
+        # The learning system natively covers: LLM+Integrity+UserFeedback+Cost
+        # signal merge, provenance tagging, multi-dim scoring, A/B shadows,
+        # and promote/demote verdicts. Legacy auto-apply-on-repeat is kept
+        # behind MULTI_AGENT_LEGACY_RULE_OPTIMIZER=1 as an escape hatch.
+        use_legacy = os.environ.get("MULTI_AGENT_LEGACY_RULE_OPTIMIZER", "0") == "1"
+        if not use_legacy:
             self._run_rule_evolver(suggestions, history)
             return
 

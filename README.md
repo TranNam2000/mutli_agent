@@ -354,13 +354,53 @@ blends critic score with real outcomes:
 | module     | 0.40         | 0.20   | 0.40    |
 | full_app   | 0.45         | 0.15   | 0.40    |
 
-### 4. Meta-learning triggers (cross-session)
+### 4. Learning system (unified, default ON)
 
-After each pipeline run:
+After every pipeline run the learning system consolidates four signal
+sources into one rule-evolution stream — no separate path, no opt-in:
+
+1. **LLM analysis** of critic REVISE patterns (`RuleOptimizerAgent`)
+2. **IntegrityRules tables** — module blacklist, keyword risk, agent
+   reputation (zero-token deterministic suggestions)
+3. **User feedback** via `mag feedback <session> --agent X --rating N
+   --comment "..."` (read from `rules/<profile>/.feedback/*.jsonl`)
+4. **Cost signals** from ScoreAdjuster (per-agent token pressure)
+
+Every suggestion is tagged with **provenance** (source + session + ts +
+score) as an inline HTML comment inside the rule file, so any clause
+can be traced back to its origin.
+
+Each proposal is then scored along **4 dimensions**:
+
+| Dim           | Weight | Meaning                                   |
+|---------------|--------|-------------------------------------------|
+| correctness   | 0.40   | Does it reduce real errors?               |
+| consistency   | 0.30   | Does it contradict / duplicate existing?  |
+| usability     | 0.15   | Does it reduce downstream clarifications? |
+| cost          | 0.15   | Does it avoid token bloat?                |
+
+Consensus boost: when ≥ 2 sources propose the same change, multi-dim
+score is multiplied by up to 1.2×.
+
+Routing by final score:
+
+| Lane        | Threshold                               | Action                      |
+|-------------|-----------------------------------------|-----------------------------|
+| **auto**    | score ≥ 0.80 AND ≥ 3 consensus sources  | Append to rule file now     |
+| **shadow**  | score ∈ [0.60, 0.80)                    | Write `<agent>.shadow.md`, A/B test |
+| **pending** | score < 0.60                            | Queue for user review       |
+
+Shadow A/B:
+- Baseline vs shadow run in parallel for ≥ 2 sessions.
+- shadow − baseline ≥ +0.30 → PROMOTE (shadow replaces baseline; old
+  baseline archived as `.rejected.md`).
+- shadow − baseline ≤ −0.30 → DEMOTE (shadow deleted).
+- Otherwise → keep testing.
+
+Classic meta-learning triggers (still active):
 
 | Trigger                                           | Action                                  |
 |---------------------------------------------------|-----------------------------------------|
-| REVISE pattern recurs ≥ 5 sessions                | Auto-apply rule/criteria change         |
 | Applied rule causes score drop ≥ 0.5 (2+ sessions)| Auto-rollback + blacklist pattern       |
 | Agent avg ≥ 8.5 for 3 consecutive sessions        | Auto-upgrade PASS_THRESHOLD +1          |
 | Skill avg < 5.0 across ≥ 5 uses                   | Auto-deprecate (if other skills exist)  |
@@ -370,6 +410,9 @@ After each pipeline run:
 | Module accumulates ≥ 3 post-skip failures         | `module_blacklist` → force Critic       |
 | Agent accumulates ≥ 2 false-negatives             | `agent_reputation` force-Critic window 5 |
 | Keyword appears in ≥ 1 failure blocker            | `keyword_risk` promote to med/high      |
+
+Set `MULTI_AGENT_LEGACY_RULE_OPTIMIZER=1` to restore the pre-evolver
+auto-apply-on-repeat behaviour (useful only for debugging).
 
 ### 5. Shadow A/B for skill evolution
 
@@ -405,7 +448,26 @@ export MULTI_AGENT_SKILL_REVIEW=0          # 1 = prompt before writing new skill
 export MULTI_AGENT_CRITIC_ALL=0            # 1 = run Critic for every step (legacy; default only dev+test)
 export MULTI_AGENT_TL_CRITIC_ALWAYS=0      # 1 = always run Critic for TechLead (ignores complexity/type gate)
 export MULTI_AGENT_TL_CRITIC_NEVER=0       # 1 = never run Critic for TechLead (cheapest)
+export MULTI_AGENT_LEGACY_RULE_OPTIMIZER=0 # 1 = use pre-RuleEvolver rule update path (debug only)
+export MULTI_AGENT_SKILL_LLM=0             # 1 = let Claude pick 1..MAX skills (costs ~5k tok/session)
+export MULTI_AGENT_SKILL_MAX=2             # cap active skills per agent (default 2; 1 = single)
 ```
+
+### User feedback — close the loop with one command
+
+After a session finishes, if the output missed the mark, file a rating
+so the learning system picks it up:
+
+```bash
+mag feedback 20260420_063112_abcd --agent ba --rating 2 \
+    --comment "AC thiếu edge case về offline retry"
+```
+
+Entries land in `rules/<profile>/.feedback/*.jsonl`. On the next
+session, `RuleEvolver` translates low-rating aggregates into
+`SRC_USER`-tagged suggestions with the highest source weight, feeding
+them through the same merge + multi-dim scoring + shadow A/B pipeline
+as LLM and IntegrityRules suggestions.
 
 ## License
 
