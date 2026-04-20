@@ -194,11 +194,11 @@ class BaseAgent:
         import tempfile
         system_text = self._build_system(system)
         env = {**os.environ}
-        # Previously this line stripped ANTHROPIC_API_KEY to force Claude Code's
-        # OAuth session. That breaks in Claude Code 2.1+ where the session is
-        # managed separately from the env. We now preserve the full env — if the
-        # user wants to prefer subscription auth they can explicitly
-        # `unset ANTHROPIC_API_KEY` in their shell.
+        # Env-var policy:
+        #   * Default: keep ANTHROPIC_API_KEY if set. Works for API-billed users.
+        #   * If MULTI_AGENT_STRIP_API_KEY=1 → always strip (force OAuth).
+        #   * _call_with_retry has a fallback: on 'Invalid API key' it strips
+        #     the key and retries once so Claude Code session can take over.
         if os.environ.get("MULTI_AGENT_STRIP_API_KEY", "0") == "1":
             env.pop("ANTHROPIC_API_KEY", None)
 
@@ -254,12 +254,21 @@ class BaseAgent:
                     # so the user actually sees what went wrong.
                     combined = stderr or stdout or "(no output on stderr or stdout)"
                     lower = combined.lower()
-                    if any(k in lower for k in ("authentication", "api key",
+                    # Auto-recover from invalid API key: if one is set in env,
+                    # drop it and fall back to Claude Code session on retry.
+                    if ("invalid api key" in lower or "external api key" in lower) \
+                            and "ANTHROPIC_API_KEY" in env:
+                        print(f"  🔑 [{self.ROLE}] Invalid API key detected — "
+                              f"falling back to Claude Code session for this session.")
+                        env.pop("ANTHROPIC_API_KEY", None)
+                        # Don't count this as a retry attempt; try again immediately.
+                        continue
+                    if any(k in lower for k in ("authentication",
                                                  "unauthorized", "403",
-                                                 "not logged in", "login required")):
+                                                 "not logged in", "login required",
+                                                 "please run /login")):
                         raise RuntimeError(
-                            f"Auth error (not retryable): {combined[:400]}\n"
-                            "Run: claude login"
+                            f"Auth error (not retryable): {combined[:400]}"
                         )
                     if any(k in lower for k in ("unknown option", "unrecognized",
                                                  "invalid argument", "unknown flag")):
