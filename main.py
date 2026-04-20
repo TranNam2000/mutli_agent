@@ -242,7 +242,6 @@ def main():
     # ── chat : interactive multi-turn mode ──────────────────────────────────────
     if len(sys.argv) >= 2 and sys.argv[1] == "chat":
         from core.ux import chat_loop
-        from orchestrator import ProductDevelopmentOrchestrator
 
         def _run(task, resources):
             budget = detect_budget()
