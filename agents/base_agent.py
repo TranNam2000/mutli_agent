@@ -237,13 +237,10 @@ class BaseAgent:
                 argv = list(primary_argv)
                 argv[argv.index(None)] = tmp.name   # inject tmp path
 
-                clean_env = {k: v for k, v in os.environ.items()
-                               if k != "ANTHROPIC_API_KEY"}
                 result = subprocess.run(
                     argv,
                     capture_output=True,
                     text=True,
-                    env=clean_env,
                     timeout=600,
                 )
                 if result.returncode != 0:
@@ -312,14 +309,12 @@ class BaseAgent:
             tmp.write(system_text)
             tmp.flush()
             tmp.close()
-            clean_env = {k: v for k, v in os.environ.items()
-                           if k != "ANTHROPIC_API_KEY"}
             result = subprocess.run(
                 ["claude", "-p", user_message,
                  "--system-prompt-file", tmp.name,
                  "--image", str(img),
                  "--output-format", "text", "--bare"],
-                capture_output=True, text=True, env=clean_env, timeout=300,
+                capture_output=True, text=True, timeout=300,
             )
             if result.returncode != 0:
                 err = (result.stderr or "").strip() or (result.stdout or "").strip()

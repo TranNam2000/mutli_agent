@@ -51,13 +51,10 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
         tmp.write(system)
         tmp.flush()
         tmp.close()
-        import os as _os
-        clean_env = {k: v for k, v in _os.environ.items()
-                       if k != "ANTHROPIC_API_KEY"}
         result = subprocess.run(
             ["claude", "-p", text, "--system-prompt-file", tmp.name,
              "--output-format", "text", "--bare"],
-            capture_output=True, text=True, env=clean_env, timeout=120,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
