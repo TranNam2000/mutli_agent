@@ -473,13 +473,73 @@ class ProductDevelopmentOrchestrator:
     def _skip(self, key: str, role: str):
         tprint(f"\n  ⏭️  SKIP {role} — checkpoint found ({self.session_id}_{key}.md)")
 
-    def _detect_skill_for(self, agent, task_text: str):
-        """Wrapper to auto-pick skill before running an agent. Safe-fallback on error."""
+    def _detect_skill_for(self, agent, task_text: str, tasks: list | None = None):
+        """Wrapper to auto-pick skill before running an agent. Safe-fallback on error.
+
+        When `tasks` is provided, builds a compact metadata summary and
+        forwards it so LLM-auto skill pick can route on semantic signals.
+        """
         try:
             if hasattr(agent, "detect_skill"):
-                agent.detect_skill(task_text)
+                meta = self._build_skill_metadata_summary(tasks) if tasks else None
+                agent.detect_skill(task_text, task_metadata=meta)
         except Exception as e:
             tprint(f"  ⚠️  skill detect failed for {agent.ROLE}: {e}")
+
+    def _build_skill_metadata_summary(self, tasks: list | None) -> dict:
+        """
+        Derive a compact {scopes, max_risk, max_complexity, impact_area,
+        integrity_blacklist_hits, emergency_audit, hotfix_p0} signal bundle
+        used to steer the LLM skill picker.
+
+        Safe to call with empty tasks — returns an empty dict.
+        """
+        if not tasks:
+            return {}
+        scopes: set[str] = set()
+        risks: list[str] = []
+        complexities: list[str] = []
+        impact_areas: set[str] = set()
+        hot_p0 = False
+        for t in tasks:
+            try:
+                m = t.get_metadata() if hasattr(t, "get_metadata") else None
+            except Exception:
+                m = None
+            if m is None:
+                continue
+            scopes.add(m.context.scope)
+            risks.append(m.context.risk_level)
+            complexities.append(m.context.complexity)
+            impact_areas.update(m.technical_debt.impact_area or [])
+            if m.is_hot_p0():
+                hot_p0 = True
+
+        risk_rank = {"low": 0, "med": 1, "high": 2}
+        cplx_rank = {"S": 0, "M": 1, "L": 2, "XL": 3}
+        max_risk = max(risks, key=lambda r: risk_rank.get(r, 0)) if risks else None
+        max_cpx  = max(complexities,
+                        key=lambda c: cplx_rank.get(c, 0)) if complexities else None
+
+        integrity_alerts: list[str] = []
+        integrity = getattr(self, "_integrity", None)
+        if integrity is not None:
+            for area in impact_areas:
+                try:
+                    if integrity.module_forces_critic(area):
+                        integrity_alerts.append(area)
+                except Exception:
+                    pass
+
+        return {
+            "scopes":                   sorted(scopes),
+            "max_risk":                 max_risk,
+            "max_complexity":           max_cpx,
+            "impact_area":              sorted(impact_areas),
+            "integrity_blacklist_hits": integrity_alerts,
+            "emergency_audit":          bool(getattr(self, "_emergency_audit", False)),
+            "hotfix_p0":                hot_p0,
+        }
 
     def _maybe_refresh_context(self):
         """Long-session safeguard — rebuild scoped context if files changed externally."""
@@ -1213,7 +1273,8 @@ class ProductDevelopmentOrchestrator:
             if not self._check_quota("Design UI tasks"): return {}
             self._header(2, 6, "Designer", f"processing {len(ui_tasks)} UI tasks (reuse or create)...")
             des._current_step = "design"
-            des.detect_skill(product_idea)
+            des.detect_skill(product_idea,
+                              task_metadata=self._build_skill_metadata_summary(ui_tasks))
             existing_ds = self.project_info and self._find_existing_design_system() or ""
             design_refs = des.process_ui_tasks(ui_tasks, existing_ds)
             reused = sum(1 for r in design_refs.values() if r.startswith("[REUSE]"))
@@ -1253,7 +1314,8 @@ class ProductDevelopmentOrchestrator:
             self._header(3, 6, "Tech Lead (prioritizer)",
                          "evaluating resources + prioritize sprint...")
             tl._current_step = "techlead"
-            tl.detect_skill(product_idea)
+            tl.detect_skill(product_idea,
+                             task_metadata=self._build_skill_metadata_summary(tasks))
             # Role contribution: TL enriches metadata (impact_area + risk bump)
             # before its Critic gate is evaluated.
             if hasattr(tl, "enrich_metadata"):
@@ -1308,7 +1370,8 @@ class ProductDevelopmentOrchestrator:
             if not self._check_quota("Test plan from sprint"): return {}
             self._header(4, 6, "QA (planner)", "writing test plan in sprint priority order...")
             qa._current_step = "test_plan"
-            qa.detect_skill(product_idea)
+            qa.detect_skill(product_idea,
+                             task_metadata=self._build_skill_metadata_summary(tasks))
             if sprint_plan is not None:
                 test_plan = qa.plan_from_sprint(sprint_plan, tasks)
             else:
@@ -1324,7 +1387,8 @@ class ProductDevelopmentOrchestrator:
             if not self._check_quota("Dev implementation"): return {}
             self._header(5, 6, "Developer", "implementing tasks in sprint order...")
             dev._current_step = "dev"
-            dev.detect_skill(product_idea)
+            dev.detect_skill(product_idea,
+                              task_metadata=self._build_skill_metadata_summary(tasks))
             # Feed top-priority tasks first
             top_tasks_md = "\n\n".join(
                 t.to_markdown() for t in sorted(tasks, key=lambda x: -x.priority_score)[:8]

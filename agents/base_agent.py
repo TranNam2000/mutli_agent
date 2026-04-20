@@ -78,7 +78,8 @@ class BaseAgent:
                 return base
         return base
 
-    def detect_skill(self, task: str, scope_hint: str | None = None) -> dict | None:
+    def detect_skill(self, task: str, scope_hint: str | None = None,
+                      task_metadata: dict | None = None) -> dict | None:
         """Auto-select best skill for this task. Falls back to LLM when heuristics ambiguous.
 
         Environment controls:
@@ -86,6 +87,12 @@ class BaseAgent:
                                       (opt-in; costs ~800 tok/agent × steps).
           MULTI_AGENT_SKILL_MAX=2  → cap on number of active skills per agent
                                       (default 2; 1 disables multi-skill).
+
+        `task_metadata` (optional) — compact summary of TaskMetadata across
+        the current task batch. Only populated for agents that run AFTER
+        BA has emitted metadata (TL/Design/Dev/Test). The LLM picker uses
+        it to route on semantic signals (scope/risk/impact_area/integrity
+        alerts) rather than keyword text.
 
         Returns the PRIMARY skill for back-compat with existing callers;
         the full list is available via `self._active_skills`.
@@ -109,8 +116,9 @@ class BaseAgent:
         def _llm_single(key, t, candidates):
             return llm_pick_skill(self._call, key, t, candidates)
 
-        def _llm_multi(_mode, agent_key, t, candidates, m):
-            return llm_pick_skills_multi(self._call, agent_key, t, candidates, m)
+        def _llm_multi(_mode, agent_key, t, candidates, m, meta=None):
+            return llm_pick_skills_multi(self._call, agent_key, t, candidates,
+                                          m, task_metadata=meta)
 
         fallback = _llm_multi if llm_auto else _llm_single
         skills = select_skills(
@@ -121,6 +129,7 @@ class BaseAgent:
             llm_fallback=fallback,
             max_n=max_n,
             llm_auto=llm_auto,
+            task_metadata=task_metadata,
         )
         if not skills:
             return None

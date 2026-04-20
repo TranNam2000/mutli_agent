@@ -203,8 +203,36 @@ def llm_pick_skill(call_fn, agent_key: str, task: str, candidates: list[dict]) -
     return candidates[0]["skill_key"]
 
 
+def format_metadata_summary(meta: dict | None) -> str:
+    """Render a compact metadata block for LLM prompts. Empty string if None."""
+    if not meta:
+        return ""
+    lines = []
+    if meta.get("scopes"):
+        lines.append(f"- scope: {', '.join(meta['scopes'])}")
+    if meta.get("max_risk"):
+        lines.append(f"- max risk_level: {meta['max_risk']}")
+    if meta.get("max_complexity"):
+        lines.append(f"- max complexity: {meta['max_complexity']}")
+    if meta.get("impact_area"):
+        lines.append(f"- impact_area: {', '.join(meta['impact_area'])}")
+    if meta.get("integrity_blacklist_hits"):
+        lines.append(
+            "- integrity alerts (force strict skill): "
+            f"{', '.join(meta['integrity_blacklist_hits'])}"
+        )
+    if meta.get("emergency_audit"):
+        lines.append("- session state: EMERGENCY_AUDIT active (prior skipped-Critic failed QA)")
+    if meta.get("hotfix_p0"):
+        lines.append("- hotfix+P0 present → live incident mode")
+    if not lines:
+        return ""
+    return "\n## Task metadata (decision signals)\n" + "\n".join(lines)
+
+
 def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
-                           candidates: list[dict], max_n: int = 2) -> list[str]:
+                           candidates: list[dict], max_n: int = 2,
+                           task_metadata: dict | None = None) -> list[str]:
     """
     Ask Claude to pick 1..max_n complementary skills. Used by LLM-auto mode
     (env MULTI_AGENT_SKILL_LLM=1). Returns skill_keys in priority order.
@@ -212,20 +240,29 @@ def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
     Strategy: tell the model to pick at most `max_n` and prefer picking 1
     unless the task genuinely spans two orthogonal concerns (e.g. stack +
     domain). Fallback: first candidate.
+
+    When `task_metadata` is provided (typically for TL/Design/Dev/Test
+    steps that run after BA has emitted metadata), a compact summary is
+    injected into the prompt so the model can route on semantic signals
+    (scope, risk, impact_area, integrity alerts) instead of keyword text.
     """
     options = "\n".join(
         f"- {s['skill_key']}: scope={s['scope']}  triggers={', '.join(s['triggers'][:5])}"
         for s in candidates
     )
+    meta_block = format_metadata_summary(task_metadata)
     system = (
         f"You là agent {agent_key}. Với task sau, chọn TỪ 1 ĐẾN {max_n} skill "
         f"để kết hợp. Chỉ chọn >1 khi task thực sự chạm nhiều concern độc lập "
-        f"(stack + domain, stack + mode, v.v.). Trả lời gọn:\n"
-        f"SKILLS: skill_key_1, skill_key_2"
+        f"(stack + domain, stack + mode, v.v.).\n"
+        f"Khi có Task metadata: ưu tiên skill khớp scope/risk/impact_area; "
+        f"nếu có integrity alert cho 1 module → bắt buộc pick skill defensive "
+        f"(ecommerce/hotfix_emergency/integration_api...).\n"
+        f"Trả lời gọn:\nSKILLS: skill_key_1, skill_key_2"
     )
-    user = f"Task:\n{task[:600]}\n\nSkills có sẵn:\n{options}"
+    user = f"Task:\n{task[:600]}\n{meta_block}\n\nSkills có sẵn:\n{options}"
     try:
-        raw = call_fn(system, user, max_tokens=100)
+        raw = call_fn(system, user, max_tokens=120)
         import re as _re
         m = _re.search(r"SKILLS:\s*(.+)", raw, _re.IGNORECASE)
         names_line = m.group(1) if m else raw
@@ -248,7 +285,8 @@ def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
 
 def select_skills(agent_key: str, task: str, project_context: str = "",
                    scope_hint: str | None = None, llm_fallback=None,
-                   max_n: int = 2, llm_auto: bool = False) -> list[dict]:
+                   max_n: int = 2, llm_auto: bool = False,
+                   task_metadata: dict | None = None) -> list[dict]:
     """
     Return 1..max_n skills to activate for this agent+task.
 
@@ -282,7 +320,8 @@ def select_skills(agent_key: str, task: str, project_context: str = "",
     # ── LLM-auto mode: hand the top candidates to Claude and honour its pick
     if llm_auto and llm_fallback and len(scored) >= 1:
         candidates = [s for _, s in scored[: max(max_n + 1, 3)]]
-        picked_keys = llm_fallback("multi", agent_key, task, candidates, max_n)
+        picked_keys = llm_fallback("multi", agent_key, task, candidates,
+                                    max_n, task_metadata)
         picked: list[dict] = []
         for key in picked_keys:
             for _, s in scored:
