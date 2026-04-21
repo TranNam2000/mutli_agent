@@ -438,8 +438,8 @@ def _vision_detect_input(page):
     )
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt, "--image", tmp_img.name,
-             "--output-format", "text", "--bare"],
+            ["claude", "--image", tmp_img.name],
+            input=prompt,
             capture_output=True, text=True, timeout=30,
             env={**os.environ},
         )

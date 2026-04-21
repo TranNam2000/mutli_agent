@@ -95,7 +95,7 @@ TASK-002 | CREATE | - | -
 TASK-003 | REUSE | ListItemCard | reuse as-is"""
 
         try:
-            raw = self._call(system, prompt, max_tokens=800)
+            raw = self._call(system, prompt)
         except Exception:
             return {}
 
@@ -133,7 +133,7 @@ REUSE: YES|NO
 COMPONENT_NAME: [existing component name if REUSE=YES]
 EXTENSION_NOTES: [what to fix/extend if any]"""
         try:
-            raw = self._call(system, prompt, max_tokens=300)
+            raw = self._call(system, prompt)
             reuse = "REUSE: YES" in raw
             name_m = __import__("re").search(r"COMPONENT_NAME:\s*(.+)", raw)
             ext_m  = __import__("re").search(r"EXTENSION_NOTES:\s*(.+)", raw)
@@ -163,7 +163,7 @@ Build concise design spec for 1 task (≤ 40 lines):
 - Components needed + dimensions + states (loading/empty/error/success)
 - Interactions + animations
 - Reuse existing tokens if design system is provided"""
-        return self._call(self.system_prompt, prompt, max_tokens=1500)
+        return self._call(self.system_prompt, prompt)
 
     def clarify_with_ba(self, ba_agent: BaseAgent, prd: str) -> str:
         """Ask BA to clarify UX-related requirements before designing."""
@@ -174,7 +174,6 @@ PRD (summary):
         question = self._call(
             f"You is {self.ROLE}. Ask a concise question (max 80 words) to BA about unclear UX requirements.",
             question_prompt,
-            max_tokens=300,
         )
         return self.ask(ba_agent, question)
 
@@ -192,7 +191,7 @@ PRD (summary):
 {project_plan[:1500]}...{clarification_block}
 
 Build detailed design specs including design system, wireframes for key screens, and component specifications. Focus on top-priority screens/features in Sprint 1."""
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
 
     # 3 chiều thực sự đo is from ảnh tĩnh
     # Flow and contrast ratio chính xác no đo is from 1 screenshot
@@ -256,7 +255,7 @@ ISSUES:
 REVISION_GUIDE:
 - [fix cụ can, actionable — enough to do ngay in Stitch]"""
 
-        raw = self._call_with_image(system, prompt, screenshot_path, max_tokens=1200)
+        raw = self._call_with_image(system, prompt, screenshot_path)
         return self._parse_review(raw)
 
     def _parse_review(self, raw: str) -> dict:
@@ -307,7 +306,7 @@ REVISION_GUIDE:
             "for Stitch AI to generate UI. Max 300 from. "
             "Bao gồm: name app, màu chính, font, layout chính, components important nhất."
         )
-        return self._call(system, design_specs[:3000], max_tokens=500)
+        return self._call(system, design_specs[:3000])
 
     def auto_stitch_loop(self, design_specs: str, session_id: str, max_rounds: int = 3) -> str | None:
         """
@@ -344,7 +343,7 @@ REVISION_GUIDE:
                 )
                 issues_text = "\n".join(f"- {i}" for i in review["issues"])
                 refine_input = f"Prompt gốc:\n{stitch_prompt}\n\nIssues need fix:\n{issues_text}"
-                stitch_prompt = self._call(refine_system, refine_input, max_tokens=500)
+                stitch_prompt = self._call(refine_system, refine_input)
                 print(f"\n  🔄 Prompt refined, try again...")
 
         print(f"\n  ⚠️  Done {max_rounds} rounds — use screenshot cuối cùng.")

@@ -43,7 +43,7 @@ Chỉ liệt kê file paths, mỗi file a dòng, bắt đầu bằng "FILE: ".
 
 Chỉ liệt kê max 8 file important nhất. Format: FILE: path/to/file.dart"""
 
-        raw_files = self._call(_SYSTEM, identify_prompt, max_tokens=600)
+        raw_files = self._call(_SYSTEM, identify_prompt)
         file_paths = re.findall(r"FILE:\s*(.+)", raw_files)
 
         # Step 2: read files from disk
@@ -86,7 +86,7 @@ GAP: [thiếu gì so with task request]
 ### 💡 Recommendation
 [nên implement per hướng nào, follow pattern current tại or need refactor]"""
 
-        return self._call(_SYSTEM, report_prompt, max_tokens=2500)
+        return self._call(_SYSTEM, report_prompt)
 
     def _resolve_base_dirs(self) -> list[Path]:
         """

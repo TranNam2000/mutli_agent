@@ -106,12 +106,15 @@ class RouteDecision:
     sub_tasks: list[dict] = field(default_factory=list)   # [{kind, desc}]
     source: str = "heuristic"   # "heuristic" | "llm"
     raw: str = ""
+    dynamic_steps: list[str] = field(default_factory=list)  # PM-decided steps
 
     @property
     def is_clear(self) -> bool:
         return self.confidence >= 0.6 and self.kind in ALL_KINDS
 
     def dispatch_steps(self) -> list[str]:
+        if self.dynamic_steps:
+            return list(self.dynamic_steps)
         return list(DISPATCH_PLAN.get(self.kind, DISPATCH_PLAN[KIND_FEATURE]))
 
     def to_markdown(self) -> str:
@@ -147,21 +150,56 @@ class PMAgent(BaseAgent):
         """Return a RouteDecision. Tries heuristic first, falls back to LLM."""
         heur = self._heuristic(request)
         if heur is not None and heur.confidence >= 0.85:
-            return heur
+            decision = heur
+        else:
+            llm = self._llm_classify(request)
+            if llm is None:
+                decision = heur or RouteDecision(
+                    kind=KIND_FEATURE,
+                    confidence=0.4,
+                    reason="Fallback: could not classify reliably, defaulting to feature.",
+                    source="default",
+                )
+            else:
+                decision = llm
 
-        # Heuristic was ambiguous or empty — ask the LLM.
-        llm = self._llm_classify(request)
-        if llm is None:
-            # LLM failed — fall back to whatever heuristic gave us, or default.
-            if heur is not None:
-                return heur
-            return RouteDecision(
-                kind=KIND_FEATURE,
-                confidence=0.4,
-                reason="Fallback: could not classify reliably, defaulting to feature.",
-                source="default",
-            )
-        return llm
+        # Let PM dynamically decide which steps are actually needed
+        decision.dynamic_steps = self._llm_decide_steps(request, decision.kind)
+        return decision
+
+    def _llm_decide_steps(self, request: str, kind: str) -> list[str]:
+        """Ask PM to decide which pipeline steps are needed for this specific task."""
+        all_steps = ["ba", "design", "techlead", "test_plan", "dev", "test"]
+        default = DISPATCH_PLAN.get(kind, DISPATCH_PLAN[KIND_FEATURE])
+        prompt = f"""You are a Project Manager deciding which pipeline steps to run for this task.
+
+Available steps:
+- ba: Requirements analysis — needed when task has complex business rules or unclear scope
+- design: UI/UX design — needed when task has screen/UI components
+- techlead: Architecture decisions — needed when task requires new modules, APIs, or complex logic
+- test_plan: Test planning — needed when task is complex or high-risk
+- dev: Implementation — almost always needed
+- test: QA review — almost always needed
+
+Task kind: {kind}
+Request:
+{request.strip()[:1000]}
+
+Reply with ONLY a comma-separated list of steps needed, in order. Example:
+STEPS: ba, design, techlead, dev, test
+
+Choose only what is truly necessary. Omit steps that add no value for this task."""
+
+        try:
+            raw = self._call(self.system_prompt, prompt)
+            m = re.search(r"STEPS:\s*([a-z_,\s]+)", raw, re.IGNORECASE)
+            if m:
+                steps = [s.strip() for s in m.group(1).split(",") if s.strip() in all_steps]
+                if steps and "dev" in steps:
+                    return steps
+        except Exception as e:
+            print(f"  ⚠️  [PM] dynamic steps failed: {e}")
+        return list(default)
 
     def dispatch_plan(self, kind: str) -> list[str]:
         """Expose DISPATCH_PLAN for the orchestrator."""
@@ -218,7 +256,7 @@ class PMAgent(BaseAgent):
             f"{request.strip()}\n"
         )
         try:
-            raw = self._call(self.system_prompt, prompt, max_tokens=500)
+            raw = self._call(self.system_prompt, prompt)
         except Exception as e:
             print(f"  ⚠️  [PM] LLM classify failed: {e}")
             return None

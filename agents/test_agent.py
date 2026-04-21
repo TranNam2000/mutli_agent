@@ -69,7 +69,7 @@ Cuối output: Exit criteria + Performance targets for P0 tasks.
 Cũng output Patrol code (```dart```) and Maestro YAML (```yaml```) for các TC P0 + P1.
 Maestro flow đặt in comment: `# maestro/<filename>.yaml`
 """
-        return self._call(self._phase_prompt("test_plan"), prompt, max_tokens=8000)
+        return self._call(self._phase_prompt("test_plan"), prompt)
 
     def verify_edge_cases(self, dev_agent: BaseAgent, implementation: str) -> str:
         """Ask Dev about edge cases and error handling in the implementation."""
@@ -80,7 +80,6 @@ Implementation:
         question = self._call(
             f"You is {self.ROLE}. Ask a concise question (max 80 words) to Dev about edge cases or error handling behavior.",
             question_prompt,
-            max_tokens=300,
         )
         return self.ask(dev_agent, question)
 
@@ -97,7 +96,7 @@ Implementation:
 {implementation}
 
 Build comprehensive test strategy, detailed test cases (including happy path, edge cases, negative cases), performance test scenarios, and security checklist. Ensure coverage for all acceptance criteria in PRD."""
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
 
     def create_test_plan_with_context(self, prd: str, tech_specs: str, implementation: str, dev_clarification: str) -> str:
         prompt = f"""Build a full Test Plan and Test Cases based on:
@@ -115,7 +114,7 @@ Build comprehensive test strategy, detailed test cases (including happy path, ed
 {dev_clarification}
 
 Build comprehensive test strategy, taking into account edge cases Dev confirmed."""
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
 
     # ── Phase 1: Write test cases from requirements (before implementation) ──
 
@@ -128,7 +127,6 @@ PRD:
         question = self._call(
             f"You is {self.ROLE}. Concise question (max 80 words) for BA about acceptance criteria.",
             question_prompt,
-            max_tokens=300,
         )
         return self.ask(ba_agent, question)
 
@@ -146,7 +144,7 @@ Goal: verify requirements are met, NOT verify what the code does.
 
 === BA CLARIFICATION ===
 {ba_clarification if ba_clarification else "(none)"}"""
-        return self._call(self._phase_prompt("test_plan"), prompt, max_tokens=6000)
+        return self._call(self._phase_prompt("test_plan"), prompt)
 
     # ── Phase 2: Verify implementation against test plan ────────────────────
 
@@ -224,4 +222,4 @@ Request test code:
 - Cover happy path + critical edge cases
 - Each test: explicit Arrange / Act / Assert
 - Include comment explaining which TC-ID this test verifies"""
-        return self._call(self._phase_prompt("test_review"), prompt, max_tokens=8000)
+        return self._call(self._phase_prompt("test_review"), prompt)

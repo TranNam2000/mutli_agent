@@ -36,7 +36,7 @@ QUESTIONS:
 2. [question cụ can]
 3. [question cụ can]"""
 
-        raw = self._call(self.system_prompt, prompt, max_tokens=500)
+        raw = self._call(self.system_prompt, prompt)
 
         is_clear = "CLEAR: YES" in raw
         questions = []
@@ -104,7 +104,7 @@ REASON_dev: [lý do | N/A]
 REASON_test: [lý do | N/A]
 SUMMARY: [1-2 sentence summarizing change scope]"""
 
-        raw = self._call(self.system_prompt, prompt, max_tokens=1000)
+        raw = self._call(self.system_prompt, prompt)
         return self._parse_impact(raw)
 
     def _build_doc_summary(self, docs: dict[str, str]) -> str:
@@ -246,7 +246,7 @@ REASON_test_plan: [lý do | N/A]
 REASON_test_review: [lý do | N/A]
 SUMMARY: [1-2 câu describe change scope]"""
 
-        raw = self._call(self.system_prompt, prompt, max_tokens=800)
+        raw = self._call(self.system_prompt, prompt)
         result = self._parse_impact(raw)
 
         # Fallback: if parse failed, use default based on feedback type
@@ -267,7 +267,7 @@ Analyze the request and write the feature description per your rule.
 Lưu ý:
 - If input contains 'Stakeholder Clarifications' → read carefully and use; DO NOT ask already-answered items
 - Scale output based on actual complexity (1 screen → concise, multi-feature → more complete)"""
-        return self._call(self.system_prompt, prompt, max_tokens=3000)
+        return self._call(self.system_prompt, prompt)
 
     # ── Task-based flow ───────────────────────────────────────────────────────
 
@@ -326,7 +326,7 @@ Metadata rules:
   hold: complexity=S, risk_level=low, impact_area lacks payment/auth/core.
 - Hotfix P0 → `skip_critic = ["PM","BA","TechLead"]` (live-incident Fast-Track).
 """
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
 
     def consolidate_tasks(self, tasks_markdown: str, design_refs: dict[str, str]) -> str:
         """
@@ -391,7 +391,7 @@ Rewrite the FULL task list with the following rules:
 - Never delete tasks.
 
 Return the revised ba.md content only — no prose around it."""
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
 
     def revise_with_answers(self, original_output: str, resolved: dict[str, str], original_prompt: str) -> str:
         """Revise BA output after when có answer for MISSING_INFO — tổng hợp sạch, phân cấp rõ."""
@@ -407,4 +407,4 @@ Rewrite the BA document with full updates:
 - Remove all MISSING_INFO that have been answered
 - Clear hierarchy, concise
 - Keep format per the rule"""
-        return self._call(self.system_prompt, prompt, max_tokens=3000)
+        return self._call(self.system_prompt, prompt)

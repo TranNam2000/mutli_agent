@@ -45,24 +45,16 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
         "quyết định technical, constraint, risk. Bỏ phần giải thích thừa. "
         "Output dạng bullet points concise, đầy enough thông tin."
     )
-    tmp = None
     try:
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-        tmp.write(system)
-        tmp.flush()
-        tmp.close()
         result = subprocess.run(
-            ["claude", "-p", text, "--system-prompt-file", tmp.name,
-             "--output-format", "text", "--bare"],
+            ["claude"],
+            input=f"<system>\n{system}\n</system>\n\n{text}",
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     except Exception:
         pass
-    finally:
-        if tmp:
-            Path(tmp.name).unlink(missing_ok=True)
     return text
 
 

@@ -109,7 +109,7 @@ REVISION_GUIDE:
 ASSUMPTIONS_FOUND:
 - [content] — [OK | SILENT | MISSING]"""
 
-        raw = self._call(self.system_prompt, prompt, max_tokens=1800)
+        raw = self._call(self.system_prompt, prompt)
         return self._parse(raw, checklist, threshold, wc, wf, wq)
 
     # ── Helpers ───────────────────────────────────────────────────────────────

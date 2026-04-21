@@ -401,6 +401,32 @@ def main():
         return
 
     # ── Normal run ────────────────────────────────────────────────────────────
+
+    # Auto-detect incomplete sessions and offer to resume
+    try:
+        from context.project_context_reader import detect_project_name as _dpn
+        _cur_project = _dpn(Path.cwd())
+        _incomplete = ProductDevelopmentOrchestrator.list_sessions(project_name=_cur_project)
+        if not _incomplete:
+            _incomplete = ProductDevelopmentOrchestrator.list_sessions()
+        if _incomplete:
+            _latest = _incomplete[-1]
+            _done_str = ", ".join(_latest["completed"]) or "none"
+            _left_str = ", ".join(_latest["missing"])
+            print(f"\n⏸️  Phát hiện session chưa hoàn thành: {_latest['session_id']}")
+            if _latest.get("prompt"):
+                print(f"   📝 Input   : {_latest['prompt'][:120]}")
+            print(f"   ✅ Đã xong : {_done_str}")
+            print(f"   ⏳ Còn lại : {_left_str}")
+            _ans = input("   Tiếp tục resume session này không? [Y/n] ").strip().lower()
+            if _ans in ("", "y", "yes", "có", "co"):
+                print(f"\n🔄 Resume session: {_latest['session_id']}  (profile: {profile})\n")
+                orchestrator = ProductDevelopmentOrchestrator(resume_session=_latest["session_id"], profile=profile)
+                orchestrator.run_resume()
+                return
+    except Exception:
+        pass
+
     non_flag_args = [a for a in sys.argv[1:] if not a.startswith("--") and a != _get_arg("--profile")]
     if non_flag_args:
         product_idea = _resolve_input(" ".join(non_flag_args))

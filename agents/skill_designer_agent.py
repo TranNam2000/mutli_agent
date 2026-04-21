@@ -18,7 +18,7 @@ class SkillDesignerAgent(BaseAgent):
             "Viết skill file đầy enough per format BẮT BUỘC. "
             "Kết thúc bằng dòng CONFIDENCE: ... or ABORT: ..."
         )
-        raw = self._call(self.system_prompt, user, max_tokens=2500)
+        raw = self._call(self.system_prompt, user)
         return self._parse(raw)
 
     def refine_existing(self, agent_key: str, skill_key: str,
@@ -35,7 +35,7 @@ class SkillDesignerAgent(BaseAgent):
             "No viết again toàn bộ if no need. "
             "Kết thúc bằng CONFIDENCE: ... or ABORT: ..."
         )
-        raw = self._call(self.system_prompt, user, max_tokens=2500)
+        raw = self._call(self.system_prompt, user)
         return self._parse(raw)
 
     def design_merge(self, agent_key: str, skill_a_content: str,
@@ -49,7 +49,7 @@ class SkillDesignerAgent(BaseAgent):
             "gộp SCOPE & TRIGGERS no trùng, giữ phần output có giá trị nhất of cả hai. "
             "Kết thúc bằng CONFIDENCE: ... or ABORT: ..."
         )
-        raw = self._call(self.system_prompt, user, max_tokens=3000)
+        raw = self._call(self.system_prompt, user)
         return self._parse(raw)
 
     @staticmethod

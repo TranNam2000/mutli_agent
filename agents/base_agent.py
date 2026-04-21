@@ -190,7 +190,7 @@ class BaseAgent:
     _MAX_RETRIES = 3
     _RETRY_BASE_WAIT = 2  # seconds, doubles each attempt
 
-    def _call(self, system: str, user_message: str, max_tokens: int = 4096) -> str:
+    def _call(self, system: str, user_message: str) -> str:
         """Call Claude Code CLI. Auth is handled by `claude` itself.
 
         One mechanical step: we strip ANTHROPIC_API_KEY from the subprocess
@@ -214,31 +214,14 @@ class BaseAgent:
             _CALL_SEMAPHORE.release()
 
     def _call_with_retry(self, system_text: str, user_message: str) -> str:
-        import tempfile
         last_err: Exception | None = None
-        # Primary CLI argv; we try alternate forms on CLI-error exit as a
-        # safety net for breaking changes in the `claude` binary.
-        primary_argv = [
-            "claude", "-p", user_message,
-            "--system-prompt-file", None,      # placeholder — filled per-attempt
-            "--output-format", "text",
-            "--bare",
-        ]
+        combined_input = f"<system>\n{system_text}\n</system>\n\n{user_message}"
         for attempt in range(1, self._MAX_RETRIES + 1):
             tmp = None
             try:
-                # Write system prompt to temp file to avoid shell arg size limits
-                tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                                  delete=False, encoding="utf-8")
-                tmp.write(system_text)
-                tmp.flush()
-                tmp.close()
-
-                argv = list(primary_argv)
-                argv[argv.index(None)] = tmp.name   # inject tmp path
-
                 result = subprocess.run(
-                    argv,
+                    ["claude"],
+                    input=combined_input,
                     capture_output=True,
                     text=True,
                     timeout=600,
@@ -276,55 +259,32 @@ class BaseAgent:
                     )
                 return output
 
-            except (subprocess.TimeoutExpired, RuntimeError) as e:
+            except Exception as e:
                 last_err = e
                 if "not retryable" in str(e) or attempt == self._MAX_RETRIES:
                     break
                 wait = self._RETRY_BASE_WAIT ** attempt
-                print(f"\n  ⚠️  [{self.ROLE}] Call failed (attempt {attempt}/{self._MAX_RETRIES}): {e}")
+                print(f"\n  ⚠️  [{self.ROLE}] Call failed (attempt {attempt}/{self._MAX_RETRIES}): {type(e).__name__}: {e}")
                 print(f"     Retrying in {wait}s...")
                 time.sleep(wait)
-            finally:
-                if tmp:
-                    Path(tmp.name).unlink(missing_ok=True)
+        raise RuntimeError(f"[{self.ROLE}] CLI failed after {self._MAX_RETRIES} attempts: {type(last_err).__name__}: {last_err}")
 
-        raise RuntimeError(f"[{self.ROLE}] CLI failed after {self._MAX_RETRIES} attempts: {last_err}")
-
-    def _call_with_image(self, system: str, user_message: str, image_path: str, max_tokens: int = 2048) -> str:
-        """Vision call via the same Claude Code CLI — no separate SDK or auth.
-
-        Uses `claude -p <text> --image <path>`. Auth is whatever the CLI is
-        configured with locally.
-        """
-        import tempfile
+    def _call_with_image(self, system: str, user_message: str, image_path: str) -> str:
         img = Path(image_path)
         if not img.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         system_text = self._build_system(system)
-        tmp = None
-        try:
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                               delete=False, encoding="utf-8")
-            tmp.write(system_text)
-            tmp.flush()
-            tmp.close()
-            result = subprocess.run(
-                ["claude", "-p", user_message,
-                 "--system-prompt-file", tmp.name,
-                 "--image", str(img),
-                 "--output-format", "text", "--bare"],
-                capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode != 0:
-                err = (result.stderr or "").strip() or (result.stdout or "").strip()
-                raise RuntimeError(
-                    f"Vision CLI error (exit {result.returncode}): {err[:400]}"
-                )
-            return (result.stdout or "").strip()
-        finally:
-            if tmp:
-                Path(tmp.name).unlink(missing_ok=True)
+        combined_input = f"<system>\n{system_text}\n</system>\n\n{user_message}"
+        result = subprocess.run(
+            ["claude", "--image", str(img)],
+            input=combined_input,
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip() or (result.stdout or "").strip()
+            raise RuntimeError(f"Vision CLI error (exit {result.returncode}): {err[:400]}")
+        return (result.stdout or "").strip()
 
     def ask(self, target: BaseAgent, question: str) -> str:
         """Send a question to another agent, get response, log in bus."""
@@ -353,7 +313,7 @@ class BaseAgent:
             f"Colleague {from_role} is asking you a domain question on the project. "
             "Answer concisely, to the point, max 150 words."
         )
-        return self._call(system, f"{from_role} hỏi: {question}", max_tokens=600)
+        return self._call(system, f"{from_role} hỏi: {question}")
 
     def plan_needed_info(self, task_description: str, available_context: str) -> list[dict]:
         """
@@ -377,7 +337,6 @@ READY: YES"""
         raw = self._call(
             f"You are {self.ROLE}. Evaluate available info before starting. Be concise.",
             prompt,
-            max_tokens=400,
         )
 
         if "READY: YES" in raw:
@@ -415,7 +374,7 @@ Original context:
 {original_prompt}
 
 Rebuild the improved output following the guidance above."""
-        return self._call(system, prompt, max_tokens=6000)
+        return self._call(system, prompt)
 
     def reset(self):
         pass

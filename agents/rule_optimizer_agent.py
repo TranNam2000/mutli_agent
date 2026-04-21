@@ -63,7 +63,7 @@ class RuleOptimizerAgent(BaseAgent):
 Đề xuất cải tcurrent dựa trên context thực tế ở trên.
 With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_CHECK → chỉ viết ADDITION if SAFE."""
 
-        raw = self._call(self.system_prompt, prompt, max_tokens=3000)
+        raw = self._call(self.system_prompt, prompt)
         return self._parse_suggestions(raw, profile)
 
     # ── Integrity-driven suggestions (deterministic, no LLM tokens) ──────────

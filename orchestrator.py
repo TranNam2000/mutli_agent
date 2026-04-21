@@ -397,11 +397,18 @@ class ProductDevelopmentOrchestrator:
             for sid, done in sorted(sessions.items()):
                 missing = [k for k in cls.STEP_KEYS if k not in done]
                 if missing:
+                    prompt_text = ""
+                    for candidate in proj_dir.glob(f"{sid}_prompt.txt"):
+                        try:
+                            prompt_text = candidate.read_text(encoding="utf-8").strip()
+                        except Exception:
+                            pass
                     result.append({
                         "session_id": sid,
                         "project": proj_dir.name,
                         "completed": [k for k in cls.STEP_KEYS if k in done],
                         "missing": missing,
+                        "prompt": prompt_text,
                     })
         return result
 
@@ -481,6 +488,8 @@ class ProductDevelopmentOrchestrator:
         """
         try:
             if hasattr(agent, "detect_skill"):
+                if getattr(agent, "_active_skills", None):
+                    return  # already detected — skip to avoid duplicate
                 meta = self._build_skill_metadata_summary(tasks) if tasks else None
                 agent.detect_skill(task_text, task_metadata=meta)
         except Exception as e:
@@ -1020,7 +1029,7 @@ class ProductDevelopmentOrchestrator:
 
         while True:
             choice = input("  Choose [C/R/S]: ").strip().upper()
-            if forice in ("C", "R", "S", ""):
+            if choice in ("C", "R", "S", ""):
                 break
             tprint("  Enter C, R, or S.")
 
@@ -1388,47 +1397,51 @@ class ProductDevelopmentOrchestrator:
             tprint("  ⏭️  Dev skipped (not in PM dispatch plan)")
         elif not self._step_done("dev"):
             if not self._check_quota("Dev implementation"): return {}
-            self._header(5, 6, "Developer", "implementing tasks in sprint order...")
+            self._header(5, 6, "Developer", "implementing tasks in parallel...")
             dev._current_step = "dev"
             dev.detect_skill(product_idea,
                               task_metadata=self._build_skill_metadata_summary(tasks))
-            # Feed top-priority tasks first
-            top_tasks_md = "\n\n".join(
-                t.to_markdown() for t in sorted(tasks, key=lambda x: -x.priority_score)[:8]
-            )
-            impl = self._run_with_review(
-                "dev", dev,
-                lambda: dev.implement_with_clarification(
-                    sprint_md, self.results.get("design", ""),
-                    top_tasks_md, tl_clarification="", tl_task_assignment=sprint_md,
-                ),
-                original_prompt=top_tasks_md,
-            )
+            sorted_tasks = sorted(tasks, key=lambda x: -x.priority_score)
+            design_snap = self.results.get("design", "")
+            test_plan_snap = self.results.get("test_plan", "")
+            impl_parts: list[tuple[int, str]] = []  # (idx, impl)
+            qa_parts:   list[tuple[int, str]] = []  # (idx, review)
+            lock = __import__("threading").Lock()
+
+            def _impl_and_test(idx: int, task) -> None:
+                task_md = task.to_markdown()
+                tprint(f"    [{idx+1}/{len(sorted_tasks)}] dev → {task.id}: {(task.title or '')[:50]}")
+                part = dev.implement_with_clarification(
+                    sprint_md, design_snap, task_md,
+                    tl_clarification="", tl_task_assignment=sprint_md,
+                )
+                review = qa.review_implementation(test_plan_snap, part, "")
+                with lock:
+                    impl_parts.append((idx, part))
+                    qa_parts.append((idx, review))
+                tprint(f"    [{idx+1}/{len(sorted_tasks)}] ✅ {task.id} done")
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            max_workers = int(__import__("os").environ.get("MULTI_AGENT_MAX_CONCURRENT", "3"))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_impl_and_test, i, t) for i, t in enumerate(sorted_tasks)]
+                for f in as_completed(futures):
+                    f.result()  # re-raise any exception
+
+            impl_parts.sort(key=lambda x: x[0])
+            combined_impl = "\n\n".join(p for _, p in impl_parts)
+            combined_review = "\n\n".join(r for _, r in sorted(qa_parts, key=lambda x: x[0]))
+
+            self._save("dev", combined_impl)
+            self.results["dev"] = combined_impl
+            self._save("test", combined_review)
+            self.results["test"] = combined_review
+            impl = combined_impl
             self._step_token_status("Dev")
             self._save_implementation_files(impl)
 
-        # ── STEP 6: QA review + fix loop ─────────────────────────────────────
-        if not _allowed("test") and not self._step_done("test"):
-            tprint("  ⏭️  QA review skipped (not in PM dispatch plan)")
-        elif not self._step_done("test"):
-            if not self._check_quota("QA review"): return {}
-            self._header(6, 6, "QA (reviewer)", "verifying implementation against test plan...")
-            qa._current_step = "test_review"
-            review = self._run_with_review(
-                "test", qa,
-                lambda: qa.review_implementation(
-                    self.results.get("test_plan", ""),
-                    self.results.get("dev", ""),
-                    "",
-                ),
-                original_prompt=self.results.get("test_plan", ""),
-            )
-            implementation = self._qa_dev_loop(
-                qa, dev, tl, self.results.get("test_plan", ""),
-                self.results.get("dev", ""), "", review, product_idea,
-                tasks=tasks,
-            )
-            self._save_flutter_tests(self.results.get("test", ""))
+        # ── STEP 6: QA — already done per-task inline with dev ───────────────
+        self._save_flutter_tests(self.results.get("test", ""))
 
         # ── Wrap up ──────────────────────────────────────────────────────────
         self._save_conversations()
@@ -1465,6 +1478,13 @@ class ProductDevelopmentOrchestrator:
         tprint(f"  Profile : {self.profile}")
         tprint(f"  Idea    : {product_idea[:80]}...")
         tprint("\n  Flow: PM(route) → [BA/Design/TechLead/test_plan/Dev/Test] per kind\n")
+
+        # Save original prompt so resume can show it
+        try:
+            prompt_path = self._checkpoint_path("prompt").with_suffix(".txt")
+            prompt_path.write_text(product_idea, encoding="utf-8")
+        except Exception:
+            pass
 
         if not self.maintain_mode:
             self._detect_maintain_from_task(product_idea)

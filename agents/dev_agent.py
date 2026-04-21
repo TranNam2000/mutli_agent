@@ -44,7 +44,7 @@ Rules:
 
 Output: full patched code, keep `// lib/...` comment at the top of each file."""
         try:
-            return self._call(system, prompt, max_tokens=8000)
+            return self._call(system, prompt)
         except Exception:
             # Fallback: return original unchanged
             return implementation
@@ -58,7 +58,6 @@ Tech Specs (summary):
         question = self._call(
             f"You is {self.ROLE}. Ask a concise question (max 80 words) to Tech Lead about unclear architecture points.",
             question_prompt,
-            max_tokens=300,
         )
         return self.ask(tl_agent, question)
 
@@ -88,4 +87,4 @@ Tech Specs (summary):
 Implement fully with Flutter/Dart following Clean Architecture.
 If info is missing to implement, note explicitly:
 MISSING_INFO: [info needed] — MUST_ASK: [TechLead | BA | User]"""
-        return self._call(self.system_prompt, prompt, max_tokens=8000)
+        return self._call(self.system_prompt, prompt)

@@ -338,7 +338,7 @@ ADJUST: TASK-XXX risk low→high — lý do
 
 If all OK: NONE"""
         try:
-            raw = self._call(system, prompt, max_tokens=500)
+            raw = self._call(system, prompt)
         except Exception:
             return []
         if "NONE" in raw.upper():
@@ -352,7 +352,7 @@ If all OK: NONE"""
                 continue
             adjustments.append(s[7:].strip())
             m = _re.match(
-                r"(TASK-\w+)\s+(complexity|risk)\s+(\w+)\s*[→->]+\s*(\w+)",
+                r"(TASK-\w+)\s+(complexity|risk)\s+(\w+)\s*(?:→|->|>|-)+\s*(\w+)",
                 s[7:].strip(),
             )
             if m:
@@ -381,7 +381,6 @@ Architecture (summary):
         task_list = self._call(
             f"You is {self.ROLE}. Build a concise, actionable dev task breakdown — max 200 words.",
             task_prompt,
-            max_tokens=600,
         )
         return self.ask(dev_agent, task_list)
 
@@ -403,7 +402,6 @@ PRIORITY: [fix order]"""
         fix_tasks = self._call(
             f"You is {self.ROLE}. Triage bugs from QA, assign concrete fix tasks to Dev — max 150 words.",
             triage_prompt,
-            max_tokens=400,
         )
         return self.ask(dev_agent, fix_tasks)
 
@@ -423,7 +421,7 @@ ISSUES:
 - [specific issue if any: wrong layer, wrong pattern, security hole, missing error handling]
 FEEDBACK_FOR_DEV:
 - [concrete fix guidance if needed]"""
-        return self._call(self.system_prompt, prompt, max_tokens=600)
+        return self._call(self.system_prompt, prompt)
 
     def architect_with_context(
         self,
@@ -448,4 +446,4 @@ FEEDBACK_FOR_DEV:
 
 Build the full technical architecture. If info is missing to decide, note explicitly:
 MISSING_INFO: [info needed] — MUST_ASK: [BA | PM | User]"""
-        return self._call(self.system_prompt, prompt, max_tokens=6000)
+        return self._call(self.system_prompt, prompt)
