@@ -100,7 +100,7 @@ class AuditLog:
                 continue
             try:
                 out.append(json.loads(line))
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 continue
         return out
 

@@ -26,6 +26,16 @@ class CallRecord:
     def total(self) -> int:
         return self.input_tok + self.output_tok
 
+    def to_dict(self) -> dict:
+        return {
+            "timestamp":  self.timestamp,
+            "agent":      self.agent,
+            "step":       self.step,
+            "input_tok":  self.input_tok,
+            "output_tok": self.output_tok,
+            "total":      self.total,
+        }
+
 
 class TokenTracker:
     def __init__(self, budget: int = 500_000):
@@ -108,3 +118,20 @@ class TokenTracker:
         lines.append(f"\n  Total calls: {len(self.records)}")
         lines.append(f"  {'═'*60}")
         return "\n".join(lines)
+
+    # ── JSON export ───────────────────────────────────────────────────────────
+
+    def to_dict(self) -> dict:
+        """Serialize for JSON export."""
+        by_agent: dict[str, int] = {}
+        for r in self.records:
+            by_agent[r.agent] = by_agent.get(r.agent, 0) + r.total
+        return {
+            "budget":     self.budget,
+            "used":       self.used,
+            "remaining":  self.remaining,
+            "pct":        round(self.pct, 2),
+            "call_count": len(self.records),
+            "by_agent":   by_agent,
+            "calls":      [r.to_dict() for r in self.records],
+        }

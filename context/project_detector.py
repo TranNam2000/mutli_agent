@@ -9,6 +9,7 @@ Responsibilities:
 """
 from __future__ import annotations
 import fnmatch
+import json
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -141,7 +142,6 @@ def _extract_name(root: Path, kind: str) -> str:
                 m = re.match(r"^name:\s*(.+)", line.strip())
                 if m: return m.group(1).strip()
         elif kind == "node":
-            import json
             data = json.loads((root / "package.json").read_text(encoding="utf-8", errors="ignore"))
             return data.get("name") or root.name
         elif kind == "rust":
@@ -159,7 +159,7 @@ def _extract_name(root: Path, kind: str) -> str:
                     for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
                         m = re.match(r'^name\s*=\s*["\'](.+)["\']', line.strip())
                         if m: return m.group(1).strip()
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         pass
     return root.name
 
@@ -174,7 +174,7 @@ def _find_git_root(start: Path) -> Path | None:
         )
         if r.returncode == 0:
             return Path(r.stdout.strip())
-    except Exception:
+    except (FileNotFoundError, OSError):
         pass
     # Fallback: walk up looking for .git
     p = start.resolve()

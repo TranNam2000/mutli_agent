@@ -14,7 +14,6 @@ Reads all sessions/<id>/99_SUMMARY.md + REPORT.html fragments to extract:
   - Feedback-report severity over time
 """
 from __future__ import annotations
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime

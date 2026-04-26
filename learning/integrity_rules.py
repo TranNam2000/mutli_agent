@@ -19,6 +19,7 @@ Layout under rules/<profile>/.learning/:
 All three files are plain JSON. Missing file = empty state (safe default).
 """
 from __future__ import annotations
+import re
 import json
 import threading
 from pathlib import Path
@@ -53,7 +54,7 @@ class IntegrityRules:
             return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             return None
 
     def _flush(self) -> None:
@@ -139,7 +140,6 @@ class IntegrityRules:
                     {"role": role, "window": FORCED_CRITIC_WINDOW})
 
         # 3. Keyword risk — scan blockers for common failure nouns.
-        import re
         text = " ".join(blockers).lower()
         candidates = {
             "deep link": "high", "deeplink": "high",

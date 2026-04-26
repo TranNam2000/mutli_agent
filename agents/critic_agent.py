@@ -2,7 +2,7 @@
 from __future__ import annotations
 import math
 import re
-from pathlib import Path
+from core.logging import tprint
 from .base_agent import BaseAgent, _RULES_DIR
 
 _DEFAULT_THRESHOLD = 7
@@ -101,10 +101,10 @@ With mỗi mục, trả về 1 in 3 mức (đừng gian lận — choose MISS wh
 
 After checklist, viết thêm:
 FAILED_ITEMS:
-- [item MISS/PARTIAL → lý do cụ can with bằng chứng from output]
+- [item MISS/PARTIAL → lý do cụ thể with bằng chứng from output]
 
 REVISION_GUIDE:
-- [hành động cụ can to fix]
+- [hành động cụ thể to fix]
 
 ASSUMPTIONS_FOUND:
 - [content] — [OK | SILENT | MISSING]"""
@@ -264,27 +264,27 @@ ASSUMPTIONS_FOUND:
         yes_count = sum(1 for v in answers.values() if v)
         total     = len(answers)
 
-        print(f"\n  {'─'*62}")
-        print(f"  🔍 CRITIC REVIEW — {agent_role}  [Round {round_num}]  {verdict_icon} {review['verdict']}  (pass≥{threshold})")
-        print(f"  Checklist: {yes_count}/{total} items passed")
-        print(f"  {'─'*62}")
-        print(f"  Completeness  {self._score_bar(c)}  {c:2}/10  {self._score_label(c)}")
-        print(f"  Format        {self._score_bar(f)}  {f:2}/10  {self._score_label(f)}")
-        print(f"  Quality       {self._score_bar(q)}  {q:2}/10  {self._score_label(q)}")
-        print(f"  {'·'*62}")
-        print(f"  Final         {self._score_bar(final)}  {final:2}/10")
-        print(f"  {'─'*62}")
+        tprint(f"\n  {'─'*62}")
+        tprint(f"  🔍 CRITIC REVIEW — {agent_role}  [Round {round_num}]  {verdict_icon} {review['verdict']}  (pass≥{threshold})")
+        tprint(f"  Checklist: {yes_count}/{total} items passed")
+        tprint(f"  {'─'*62}")
+        tprint(f"  Completeness  {self._score_bar(c)}  {c:2}/10  {self._score_label(c)}")
+        tprint(f"  Format        {self._score_bar(f)}  {f:2}/10  {self._score_label(f)}")
+        tprint(f"  Quality       {self._score_bar(q)}  {q:2}/10  {self._score_label(q)}")
+        tprint(f"  {'·'*62}")
+        tprint(f"  Final         {self._score_bar(final)}  {final:2}/10")
+        tprint(f"  {'─'*62}")
         if review["weaknesses"]:
-            print("  ❌ Failed items:")
+            tprint("  ❌ Failed items:")
             for w in review["weaknesses"][:4]:
-                print(f"     • {w}")
+                tprint(f"     • {w}")
         if review["verdict"] == "REVISE" and review["revision_guide"]:
-            print("  📝 Need fix:")
+            tprint("  📝 Need fix:")
             for g in review["revision_guide"][:3]:
-                print(f"     → {g}")
+                tprint(f"     → {g}")
         if review.get("assumptions"):
-            print("  📌 Assumptions:")
+            tprint("  📌 Assumptions:")
             for a in review["assumptions"][:2]:
                 icon = "🔴" if "WRONG" in a.upper() else ("🟡" if "SILENT" in a.upper() else "🟢")
-                print(f"     {icon} {a}")
-        print(f"  {'─'*62}")
+                tprint(f"     {icon} {a}")
+        tprint(f"  {'─'*62}")

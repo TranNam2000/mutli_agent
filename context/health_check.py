@@ -9,9 +9,11 @@ Supports: flutter analyze, dart analyze, npm run lint, pyright/ruff,
           existing unit tests.
 """
 from __future__ import annotations
+import hashlib
+import json
+import re
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from .project_detector import ProjectInfo
 
@@ -89,7 +91,6 @@ class HealthChecker:
     def _flutter_test(self, report: HealthReport):
         r = self._exec(["flutter", "test", "--no-pub"], timeout=180)
         report.raw_logs["test"] = (r.stdout + "\n" + r.stderr)[-3000:]
-        import re
         m = re.search(r"(\d+):\s*\+(\d+)\s*(?:-(\d+))?", r.stdout)
         if m:
             report.test_passed = int(m.group(2))
@@ -101,10 +102,9 @@ class HealthChecker:
         pkg = self.project.root / "package.json"
         if not pkg.exists():
             return
-        import json
         try:
             scripts = json.loads(pkg.read_text(encoding="utf-8")).get("scripts", {})
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             return
         if "lint" not in scripts:
             return
@@ -112,23 +112,20 @@ class HealthChecker:
         report.raw_logs["lint"] = (r.stdout + "\n" + r.stderr)[-3000:]
         if r.returncode != 0:
             # Crude: count eslint error lines
-            import re
             report.analyze_errors = len(re.findall(r"error\s", r.stdout, re.IGNORECASE))
 
     def _node_test(self, report: HealthReport):
         pkg = self.project.root / "package.json"
         if not pkg.exists():
             return
-        import json
         try:
             scripts = json.loads(pkg.read_text(encoding="utf-8")).get("scripts", {})
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             return
         if "test" not in scripts:
             return
         r = self._exec(["npm", "test", "--", "--watchAll=false"], timeout=180)
         report.raw_logs["test"] = (r.stdout + "\n" + r.stderr)[-3000:]
-        import re
         m_pass = re.search(r"Tests:.*?(\d+)\s+passed", r.stdout)
         m_fail = re.search(r"Tests:.*?(\d+)\s+failed", r.stdout)
         if m_pass: report.test_passed = int(m_pass.group(1))
@@ -148,7 +145,6 @@ class HealthChecker:
     def _python_test(self, report: HealthReport):
         r = self._exec(["python3", "-m", "pytest", "-q", "--tb=no"], timeout=180)
         report.raw_logs["test"] = (r.stdout + "\n" + r.stderr)[-3000:]
-        import re
         m = re.search(r"(\d+)\s+passed", r.stdout)
         if m: report.test_passed = int(m.group(1))
         m = re.search(r"(\d+)\s+failed", r.stdout)
@@ -185,7 +181,6 @@ class HealthChecker:
     def _build_baseline_ids(self, report: HealthReport):
         """Produce stable hash-ish IDs for each pre-existing issue so Dev's
         new output can be diffed against baseline."""
-        import hashlib
         combined = report.raw_logs.get("analyze", "") + report.raw_logs.get("test", "")
         for line in combined.splitlines():
             line = line.strip()

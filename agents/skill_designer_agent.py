@@ -1,5 +1,6 @@
 """SkillDesigner Agent — purpose-built for writing/refining skill files."""
 from __future__ import annotations
+import re
 from .base_agent import BaseAgent
 
 
@@ -13,7 +14,7 @@ class SkillDesignerAgent(BaseAgent):
         user = (
             f"Target agent: {agent_key}\n"
             f"Proposed skill_key: {proposed_key}\n\n"
-            f"Misfit pattern (bug lặp again):\n{pattern}\n\n"
+            f"Misfit pattern (bug lặp lại):\n{pattern}\n\n"
             f"Task mẫu from session:\n{task_sample}\n\n"
             "Viết skill file đầy enough per format BẮT BUỘC. "
             "Kết thúc bằng dòng CONFIDENCE: ... or ABORT: ..."
@@ -28,11 +29,11 @@ class SkillDesignerAgent(BaseAgent):
         weaknesses = "\n".join(f"- {w}" for w in recent_weaknesses[:6])
         user = (
             f"Target agent: {agent_key}\n"
-            f"Skill current tại: {skill_key}  (avg score: {avg_score:.1f}/10)\n\n"
-            f"Nội dung skill current tại:\n{current_content}\n\n"
-            f"Các weakness lặp again in reviews gần here:\n{weaknesses}\n\n"
-            "REFINE skill này: giữ phần tốt, cải tcurrent phần bị REVISE. "
-            "No viết again toàn bộ if no need. "
+            f"Skill hiện tại: {skill_key}  (avg score: {avg_score:.1f}/10)\n\n"
+            f"Nội dung skill hiện tại:\n{current_content}\n\n"
+            f"Các weakness lặp lại in reviews gần here:\n{weaknesses}\n\n"
+            "REFINE skill này: giữ phần tốt, cải thiện phần bị REVISE. "
+            "không viết lại toàn bộ nếu không cần. "
             "Kết thúc bằng CONFIDENCE: ... or ABORT: ..."
         )
         raw = self._call(self.system_prompt, user)
@@ -59,7 +60,6 @@ class SkillDesignerAgent(BaseAgent):
             return {"ok": False, "reason": reason, "content": "", "confidence": "LOW"}
 
         # Extract CONFIDENCE line (may be anywhere near end)
-        import re
         conf_m = re.search(r"CONFIDENCE:\s*(HIGH|MEDIUM|LOW)\s*[—\-]\s*(.+)",
                            raw, re.IGNORECASE)
         confidence = conf_m.group(1).upper() if conf_m else "MEDIUM"

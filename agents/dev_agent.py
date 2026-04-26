@@ -26,7 +26,7 @@ class DevAgent(BaseAgent):
         )
 
         system = (
-            f"You is {self.ROLE}. Add missing widget Key(...) to the code "
+            f"You are {self.ROLE}. Add missing widget Key(...) to the code "
             "per the list. KEEP ALL other logic/structure unchanged, only add keys."
         )
         prompt = f"""=== CURRENT CODE ===
@@ -45,7 +45,7 @@ Rules:
 Output: full patched code, keep `// lib/...` comment at the top of each file."""
         try:
             return self._call(system, prompt)
-        except Exception:
+        except (ValueError, KeyError, AttributeError, TypeError):
             # Fallback: return original unchanged
             return implementation
 
@@ -56,7 +56,7 @@ Output: full patched code, keep `// lib/...` comment at the top of each file."""
 Tech Specs (summary):
 {tech_specs[:1500]}"""
         question = self._call(
-            f"You is {self.ROLE}. Ask a concise question (max 80 words) to Tech Lead about unclear architecture points.",
+            f"You are {self.ROLE}. Ask a concise question (max 80 words) to Tech Lead about unclear architecture points.",
             question_prompt,
         )
         return self.ask(tl_agent, question)
@@ -68,6 +68,7 @@ Tech Specs (summary):
         user_story: str,
         tl_clarification: str,
         tl_task_assignment: str = "",
+        stack: str = "Flutter/Dart",
     ) -> str:
         task_block = f"\n=== TASK ASSIGNMENT FROM TECH LEAD ===\n{tl_task_assignment}" if tl_task_assignment else ""
         prompt = f"""Implement the feature based on the specs below:
@@ -84,7 +85,7 @@ Tech Specs (summary):
 === TECH LEAD ADDITIONAL CLARIFICATION ===
 {tl_clarification}{task_block}
 
-Implement fully with Flutter/Dart following Clean Architecture.
+Implement fully with {stack} following Clean Architecture.
 If info is missing to implement, note explicitly:
 MISSING_INFO: [info needed] — MUST_ASK: [TechLead | BA | User]"""
         return self._call(self.system_prompt, prompt)

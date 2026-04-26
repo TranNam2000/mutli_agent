@@ -123,7 +123,7 @@ def grep_files(root: Path, keywords: list[str], exts: set[str]) -> list[Path]:
         try:
             if re.search(pattern, f.read_text(encoding="utf-8", errors="ignore"), re.IGNORECASE):
                 matches.append(f)
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             continue
         if len(matches) >= 40:
             break
@@ -150,7 +150,7 @@ def resolve_imports(file: Path, root: Path, project_kind: str) -> list[Path]:
         return []
     try:
         text = file.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return []
 
     imports: list[Path] = []
@@ -205,7 +205,7 @@ def read_file_slice(path: Path, keywords: list[str], max_chars: int) -> str:
     """
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    except OSError:
         return ""
 
     if len(text) <= max_chars:

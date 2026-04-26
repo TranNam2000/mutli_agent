@@ -45,7 +45,7 @@ class GitHelper:
         try:
             r = self._run("rev-parse", "--is-inside-work-tree")
             return r.returncode == 0 and r.stdout.strip() == "true"
-        except Exception:
+        except (FileNotFoundError, subprocess.SubprocessError):
             return False
 
     # ── Snapshot & branch ─────────────────────────────────────────────────────

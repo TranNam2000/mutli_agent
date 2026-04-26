@@ -17,7 +17,20 @@ Usage:
     python main.py --review-ui screenshot.png --session <id>    # review UI image
     python main.py "idea" --budget 800000                       # override budget
     python main.py --reselect-plan                              # re-pick plan
+    python main.py "idea" --dry-run-learning                    # preview rule changes, don't apply
+    python main.py "idea" --auto-apply-learning                 # apply without confirmation (CI)
+    python main.py validate-rubric                              # correlation: critic score vs real outcomes
+    python main.py rubric-classifier                            # classifier status (P(regress) gate)
+    python main.py shadow-status                                # active rule A/B variants + verdicts
+    python main.py --check-arch                                 # enforce CLAUDE.md §12 rules
+
+Learning mode (env var MULTI_AGENT_LEARNING_MODE):
+    propose   (default)  every suggestion surfaced, user confirms Y/n
+    auto                 classifier gate — auto-apply when P(regress) < 0.20
+    off                  skip learning loop entirely
 """
+import os
+import re
 import sys
 from pathlib import Path
 from orchestrator import ProductDevelopmentOrchestrator
@@ -62,7 +75,6 @@ def _fetch_url(url: str) -> str:
         with urllib.request.urlopen(req, timeout=15) as r:
             raw = r.read().decode("utf-8", errors="ignore")
         # Strip HTML tags simply
-        import re
         text = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL)
         text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
         text = re.sub(r"<[^>]+>", " ", text)
@@ -168,7 +180,6 @@ def _run_ui_review(screenshot: str, session_id: str, profile: str = "default"):
     if ba_path.exists():
         content = ba_path.read_text(encoding="utf-8")
         # Extract user journey section
-        import re
         m = re.search(r"(?:User Journey|Journey Map)(.*?)(?=\n##|\Z)", content, re.DOTALL | re.IGNORECASE)
         user_journeys = m.group(1).strip()[:1000] if m else ""
 
@@ -197,16 +208,31 @@ def _run_ui_review(screenshot: str, session_id: str, profile: str = "default"):
             break
         screenshot = new_path
     else:
-        print(f"\n  ⚠️  Done {MAX_ROUNDS} rounds — use UI current tại.")
+        print(f"\n  ⚠️  Done {MAX_ROUNDS} rounds — use UI hiện tại.")
 
 
 def main():
     # Load .mag.yaml before anything else so env vars are in place.
     try:
-        from core.ux import load_config
+        from cli.ux import load_config
         load_config()
-    except Exception:
+    except (ImportError, ValueError, AttributeError, OSError):
         pass
+
+    # ── Learning-loop CLI flags (must set env before orchestrator reads them) ─
+    if "--dry-run-learning" in sys.argv:
+        os.environ["MULTI_AGENT_LEARNING_DRY_RUN"] = "1"
+        sys.argv.remove("--dry-run-learning")
+    if "--auto-apply-learning" in sys.argv:
+        os.environ["MULTI_AGENT_LEARNING_AUTO"] = "1"
+        sys.argv.remove("--auto-apply-learning")
+
+    # ── --check-arch : run architecture compliance audit ─────────────────────
+    if "--check-arch" in sys.argv:
+        from scripts.check_architecture import audit
+        report = audit()
+        report.print_summary()
+        sys.exit(0 if report.ok() else 1)
 
     # ── --doctor (environment check) ─────────────────────────────────────────
     if "--doctor" in sys.argv:
@@ -214,16 +240,52 @@ def main():
         doctor_main()
         return
 
+    # ── validate-rubric : correlation of critic vs actual outcomes ───────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "validate-rubric":
+        from analyzer import correlation_report, format_correlation_report
+        profile = _get_arg("--profile") or "default"
+        print(format_correlation_report(correlation_report(profile)))
+        return
+
+    # ── shadow-status : list active rule A/B variants + verdicts ────────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "shadow-status":
+        from cli.ux import shadow_status_report
+        profile = _get_arg("--profile") or "default"
+        print(shadow_status_report(profile))
+        return
+
+    # ── rubric-classifier : show classifier status + feature weights ─────────
+    if len(sys.argv) >= 2 and sys.argv[1] == "rubric-classifier":
+        from analyzer import (format_classifier_status, train_regression_classifier,
+                               backfill_labels)
+        from learning.revise_history import ReviseHistory
+        # (Path is imported at module level — re-importing here would shadow
+        # it function-wide and break every downstream branch.)
+        profile = _get_arg("--profile") or "default"
+        # Try to (re)train opportunistically so status reflects latest data.
+        hist_path = Path(__file__).parent / "rules" / profile / ".revise_history.json"
+        if hist_path.exists():
+            history = ReviseHistory(hist_path)
+            backfill_labels(profile, history)
+            meta = train_regression_classifier(profile, history)
+            if meta.get("fitted"):
+                print(f"\n  🤖 Classifier retrained: n={meta['n']}, "
+                      f"train_acc={meta['train_accuracy']:.2f}")
+            else:
+                print(f"\n  ⏸️  Not trained: {meta.get('reason','unknown')}")
+        print(format_classifier_status(profile))
+        return
+
     # ── status [--profile X] : health snapshot ─────────────────────────────────
     if len(sys.argv) >= 2 and sys.argv[1] == "status":
-        from core.ux import status_report
+        from cli.ux import status_report
         profile = _get_arg("--profile") or "default"
         print(status_report(profile))
         return
 
     # ── undo <session_id> [--profile X] : revert rule changes ──────────────────
     if len(sys.argv) >= 2 and sys.argv[1] == "undo":
-        from core.ux import undo_session
+        from cli.ux import undo_session
         session_id = sys.argv[2] if len(sys.argv) >= 3 else _get_arg("--session") or ""
         profile    = _get_arg("--profile") or "default"
         if not session_id:
@@ -241,7 +303,7 @@ def main():
 
     # ── chat : interactive multi-turn mode ──────────────────────────────────────
     if len(sys.argv) >= 2 and sys.argv[1] == "chat":
-        from core.ux import chat_loop
+        from cli.ux import chat_loop
 
         def _run(task, resources):
             budget = detect_budget()
@@ -424,7 +486,7 @@ def main():
                 orchestrator = ProductDevelopmentOrchestrator(resume_session=_latest["session_id"], profile=profile)
                 orchestrator.run_resume()
                 return
-    except Exception:
+    except (ValueError, KeyError, AttributeError, IndexError, OSError):
         pass
 
     non_flag_args = [a for a in sys.argv[1:] if not a.startswith("--") and a != _get_arg("--profile")]

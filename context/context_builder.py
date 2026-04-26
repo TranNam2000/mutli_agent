@@ -13,8 +13,6 @@ Each agent has different information needs:
 from __future__ import annotations
 import re
 import subprocess
-import tempfile
-from pathlib import Path
 
 SUMMARIZE_THRESHOLD = 3000  # chars — above this, summarize with LLM
 
@@ -41,7 +39,7 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
     """Summarize long context using LLM, preserving focus-relevant details."""
     system = (
         f"Tóm tắt content after to truyền for agent need thông tin về: {focus}. "
-        "Giữ again toàn bộ: number liệu cụ can, API endpoint, acceptance criteria, "
+        "giữ lại toàn bộ: number liệu cụ thể, API endpoint, acceptance criteria, "
         "quyết định technical, constraint, risk. Bỏ phần giải thích thừa. "
         "Output dạng bullet points concise, đầy enough thông tin."
     )
@@ -53,7 +51,7 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass
     return text
 
@@ -61,7 +59,7 @@ def _llm_summarize(text: str, focus: str, model: str = "claude-haiku-4-5-2025100
 def _build(source: str, focus: str, *keyword_groups: tuple[str, ...]) -> str:
     """
     Extract relevant sections from source, deduplicate, then summarize if too long.
-    Falls back to full source if no keywords match at all.
+    Falls back to full source nếu không keywords match at all.
     """
     seen_headers: set[str] = set()
     parts: list[str] = []

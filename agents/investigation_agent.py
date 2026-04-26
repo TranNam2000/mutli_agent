@@ -2,20 +2,21 @@
 from __future__ import annotations
 import re
 from pathlib import Path
+from core.logging import tprint
 from .base_agent import BaseAgent
 
-_SYSTEM = """You is a Senior Code Investigator chuyên đọc and analyze codebase current có.
+_SYSTEM = """You are a Senior Code Investigator specializing in reading and analyzing existing codebases.
 
 Nhiệm vụ:
-- Xác định các file liên quan đến task  need thực current
-- Đọc and tóm tắt implementation current tại
-- Phát current bugs, inconsistencies, or gaps so with request new
-- Cung cấp context enough to Dev/TechLead do việc KHÔNG need đoán mò
+- Xác định các file liên quan đến task hiện tại
+- Đọc và tóm tắt implementation hiện tại
+- Phát hiện bugs, inconsistencies, hoặc gaps so với request mới
+- Cung cấp context đầy đủ để Dev/TechLead làm việc KHÔNG phải đoán mò
 
-Principle:
-- Chỉ báo cáo những gì THỰC SỰ tồn tại in code, no suy đoán
-- If a file no tồn tại, ghi rõ "MISSING"
-- Ghi rõ version/pattern current tại to Dev biết need follow or refactor"""
+Nguyên tắc:
+- Chỉ báo cáo những gì THỰC SỰ tồn tại in code, không suy đoán
+- Nếu file không tồn tại, ghi rõ "MISSING"
+- Ghi rõ version/pattern hiện tại để Dev biết cần follow hay refactor"""
 
 
 class InvestigationAgent(BaseAgent):
@@ -32,8 +33,8 @@ class InvestigationAgent(BaseAgent):
             return ""
 
         # Step 1: identify relevant file paths
-        identify_prompt = f"""Dựa trên project context dưới here, liệt kê các file CẦN ĐỌC to thực current task này.
-Chỉ liệt kê file paths, mỗi file a dòng, bắt đầu bằng "FILE: ".
+        identify_prompt = f"""Dựa trên project context dưới đây, liệt kê các file CẦN ĐỌC để thực hiện task này.
+Chỉ liệt kê file paths, mỗi file một dòng, bắt đầu bằng "FILE: ".
 
 === TASK ===
 {task_description}
@@ -41,7 +42,7 @@ Chỉ liệt kê file paths, mỗi file a dòng, bắt đầu bằng "FILE: ".
 === PROJECT CONTEXT ===
 {self.project_context}
 
-Chỉ liệt kê max 8 file important nhất. Format: FILE: path/to/file.dart"""
+Chỉ liệt kê max 8 file quan trọng nhất. Format: FILE: path/to/file.dart"""
 
         raw_files = self._call(_SYSTEM, identify_prompt)
         file_paths = re.findall(r"FILE:\s*(.+)", raw_files)
@@ -55,7 +56,7 @@ Chỉ liệt kê max 8 file important nhất. Format: FILE: path/to/file.dart"""
             for path, content in file_contents.items()
         )
 
-        report_prompt = f"""Analyze code current có and tạo investigation report for task:
+        report_prompt = f"""Phân tích code hiện có và tạo investigation report cho task:
 
 === TASK ===
 {task_description}
@@ -64,27 +65,27 @@ Chỉ liệt kê max 8 file important nhất. Format: FILE: path/to/file.dart"""
 {tech_context}
 
 === CURRENT CODE ===
-{files_block if files_block else "(no tìm thấy file liên quan)"}
+{files_block if files_block else "(không tìm thấy file liên quan)"}
 
-Tạo report per format BẮT BUỘC:
+Tạo report theo format BẮT BUỘC:
 
 ## 🔍 INVESTIGATION REPORT
 
 ### 📁 Files Liên Quan
-[mỗi file: path | trạng thái (EXISTS/MISSING) | vai trò in task]
+[mỗi file: path | trạng thái (EXISTS/MISSING) | vai trò trong task]
 
 ### 📊 Current Implementation
-[mô tả concise implementation current tại, pattern  use, version library]
+[mô tả ngắn gọn implementation hiện tại, pattern sử dụng, version library]
 
 ### ⚠️ Issues & Gaps
-ISSUE: [vấn đề cụ can tìm thấy] — FILE: [name file] LINE: [dòng if biết]
-GAP: [thiếu gì so with task request]
+ISSUE: [vấn đề cụ thể tìm thấy] — FILE: [tên file] LINE: [dòng nếu biết]
+GAP: [thiếu gì so với task request]
 
 ### 🔗 Dependencies & Integration Points
-[các module/service mà task này will ảnh hưởng or phụ thuộc]
+[các module/service mà task này sẽ ảnh hưởng hoặc phụ thuộc]
 
 ### 💡 Recommendation
-[nên implement per hướng nào, follow pattern current tại or need refactor]"""
+[nên implement theo hướng nào, follow pattern hiện tại hoặc cần refactor]"""
 
         return self._call(_SYSTEM, report_prompt)
 
@@ -95,7 +96,6 @@ GAP: [thiếu gì so with task request]
         2. Absolute paths found anywhere in project_context
         3. Current working directory
         """
-        import re
         dirs: list[Path] = []
 
         # Strategy 1: look for path-like markers across all lines (not just first 5)
@@ -127,46 +127,56 @@ GAP: [thiếu gì so with task request]
 
         return dirs
 
+    @staticmethod
+    def _safe_read(path: Path, base_dirs: list[Path]) -> str | None:
+        """Read file only if it resolves within one of the allowed base dirs."""
+        try:
+            resolved = path.resolve()
+            if not resolved.is_file():
+                return None
+            for base in base_dirs:
+                try:
+                    resolved.relative_to(base.resolve())
+                    return resolved.read_text(encoding="utf-8", errors="ignore")
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+        return None
+
     def _read_files(self, file_paths: list[str]) -> dict[str, str]:
         """Try to read each file path from the project context directory."""
         result = {}
         base_dirs: list[Path] = self._resolve_base_dirs()
 
-        seen: set[str] = set()  # dedup
+        seen: set[str] = set()
 
         for raw_path in file_paths[:8]:
             raw_path = raw_path.strip()
             if raw_path in seen:
                 continue
             seen.add(raw_path)
-            content = None
 
-            # Try absolute path first
-            abs_p = Path(raw_path)
-            if abs_p.exists() and abs_p.is_file():
-                content = abs_p.read_text(encoding="utf-8", errors="ignore")
-            else:
+            # Try absolute path (validated against base_dirs)
+            content = self._safe_read(Path(raw_path), base_dirs)
+
+            if content is None:
                 # Try relative to each base dir
                 for base in base_dirs:
-                    candidate = base / raw_path
-                    if candidate.exists() and candidate.is_file():
-                        content = candidate.read_text(encoding="utf-8", errors="ignore")
+                    content = self._safe_read(base / raw_path, base_dirs)
+                    if content is not None:
                         break
 
-            if content:
-                # Trim large files
-                result[raw_path] = content
-            else:
-                result[raw_path] = "(file not found on disk)"
+            result[raw_path] = content if content is not None else "(file not found on disk)"
 
         return result
 
     def print_report(self, report: str):
-        print(f"\n  {'─'*60}")
-        print(f"  🔍 INVESTIGATION REPORT")
-        print(f"  {'─'*60}")
+        tprint(f"\n  {'─'*60}")
+        tprint(f"  🔍 INVESTIGATION REPORT")
+        tprint(f"  {'─'*60}")
         for line in report.splitlines()[:40]:
-            print(f"  {line}")
+            tprint(f"  {line}")
         if report.count("\n") > 40:
-            print(f"  ... [truncated — full report saved to checkpoint]")
-        print(f"  {'─'*60}")
+            tprint(f"  ... [truncated — full report saved to checkpoint]")
+        tprint(f"  {'─'*60}")

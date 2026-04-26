@@ -13,12 +13,13 @@ Requires `maestro` CLI installed:
 Screenshot diff uses Pillow (pip install Pillow).
 """
 from __future__ import annotations
-import json
 import os
 import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from core.logging import tprint
 
 
 @dataclass
@@ -61,7 +62,7 @@ class MaestroRunner:
                                text=True, timeout=10)
             return r.returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            print(
+            tprint(
                 '  ⚠️  Maestro CLI not yet cài. Cài bằng:\n'
                 '     curl -Ls "https://get.maestro.mobile.dev" | bash\n'
                 '     Thêm ~/.maestro/bin into PATH'
@@ -110,12 +111,12 @@ class MaestroRunner:
         results: list[MaestroFlowResult] = []
         total = 0.0
         for f in flows:
-            print(f"  ▶  Maestro flow: {f.name}")
+            tprint(f"  ▶  Maestro flow: {f.name}")
             res = self.run_flow(f)
             total += res.duration_s
             results.append(res)
             icon = "✅" if res.passed else "❌"
-            print(f"     {icon} {res.steps_total - res.steps_failed}/{res.steps_total} steps in {res.duration_s:.1f}s")
+            tprint(f"     {icon} {res.steps_total - res.steps_failed}/{res.steps_total} steps in {res.duration_s:.1f}s")
         return MaestroSuiteResult(flows=results, total_duration_s=total)
 
     def _parse_flow(self, path: Path, output: str, returncode: int) -> MaestroFlowResult:
@@ -195,7 +196,7 @@ class MaestroRunner:
             "With screenshot này:\n"
             "ALIGNED: YES|NO\n"
             "ISSUES:\n"
-            "- [vấn đề cụ can with bằng chứng]"
+            "- [vấn đề cụ thể with bằng chứng]"
         )
         try:
             raw = claude_call_with_image(system, prompt, actual_screenshot)

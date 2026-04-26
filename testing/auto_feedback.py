@@ -18,6 +18,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.logging import tprint
+
 
 @dataclass
 class FeedbackItem:
@@ -79,17 +81,17 @@ class AutoFeedback:
         else:
             return False
 
-        print(f"  🔨 Building {platform} debug...")
+        tprint(f"  🔨 Building {platform} debug...")
         try:
             r = subprocess.run(cmd, cwd=self.project_dir,
                                capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
-                print(f"  ❌ Build FAIL:\n{r.stderr[-1000:]}")
+                tprint(f"  ❌ Build FAIL:\n{r.stderr[-1000:]}")
                 return False
-            print(f"  ✅ Build OK")
+            tprint(f"  ✅ Build OK")
             return True
         except subprocess.TimeoutExpired:
-            print("  ❌ Build timeout (10min)")
+            tprint("  ❌ Build timeout (10min)")
             return False
 
     # ── Logcat scraper ────────────────────────────────────────────────────────
@@ -154,7 +156,7 @@ class AutoFeedback:
             )]
 
         suite = runner.run_all()
-        print(runner.format_suite_report(suite))
+        tprint(runner.format_suite_report(suite))
 
         items: list[FeedbackItem] = []
 
@@ -206,7 +208,7 @@ class AutoFeedback:
             )
             log_thread.daemon = True
             log_thread.start()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
 
         # 3. Maestro + visual diff
@@ -228,24 +230,24 @@ class AutoFeedback:
     # ── Display ───────────────────────────────────────────────────────────────
 
     def print_report(self, report: FeedbackReport):
-        print(f"\n  {'═'*60}")
-        print(f"  💬 AUTO-FEEDBACK REPORT")
-        print(f"  {'═'*60}")
-        print(f"  Build           : {'✅ OK' if report.build_succeeded else '❌ FAILED'}")
-        print(f"  Issues found    : {len(report.items)}")
+        tprint(f"\n  {'═'*60}")
+        tprint(f"  💬 AUTO-FEEDBACK REPORT")
+        tprint(f"  {'═'*60}")
+        tprint(f"  Build           : {'✅ OK' if report.build_succeeded else '❌ FAILED'}")
+        tprint(f"  Issues found    : {len(report.items)}")
         if report.items:
             by_sev: dict[str, int] = {}
             for i in report.items:
                 by_sev[i.severity] = by_sev.get(i.severity, 0) + 1
-            print(f"  By severity     : " + ", ".join(f"{k}:{v}" for k, v in by_sev.items()))
+            tprint(f"  By severity     : " + ", ".join(f"{k}:{v}" for k, v in by_sev.items()))
 
-        print(f"  Pass rate est.  : {report.pass_rate*100:.1f}%")
-        print(f"  {'─'*60}")
+        tprint(f"  Pass rate est.  : {report.pass_rate*100:.1f}%")
+        tprint(f"  {'─'*60}")
         for i in report.items[:10]:
             sev_icon = {"BLOCKER": "🔴", "CRITICAL": "🟠", "MAJOR": "🟡", "MINOR": "🔵"}.get(i.severity, "⚪")
-            print(f"  {sev_icon} [{i.type}] {i.description[:90]}")
+            tprint(f"  {sev_icon} [{i.type}] {i.description[:90]}")
             if i.evidence:
-                print(f"      ↳ {i.evidence[:120].splitlines()[0] if i.evidence else ''}")
+                tprint(f"      ↳ {i.evidence[:120].splitlines()[0] if i.evidence else ''}")
         if len(report.items) > 10:
-            print(f"  ... +{len(report.items) - 10} more")
-        print(f"  {'═'*60}")
+            tprint(f"  ... +{len(report.items) - 10} more")
+        tprint(f"  {'═'*60}")

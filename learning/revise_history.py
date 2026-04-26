@@ -5,9 +5,15 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from core.io_utils import atomic_write_text
+from core.state_version import (
+    CURRENT_REVISE_HISTORY_VERSION, stamp, detect_version, migrate_if_needed,
+)
+
 AUTO_THRESHOLD = 5  # auto-apply after this many occurrences
 REGRESSION_THRESHOLD = 0.5   # score drop > this → regression
 REGRESSION_MIN_SESSIONS = 2  # need at least this many post-apply sessions to judge
+BLACKLIST_DECAY_DAYS = 90    # auto-unblock blacklisted patterns after N days
 
 # Synonym groups — words in the same group are treated as identical
 _SYNONYMS: list[set[str]] = [
@@ -39,16 +45,31 @@ class ReviseHistory:
         self._data: dict = self._load()
 
     def _load(self) -> dict:
-        if self.path.exists():
-            try:
-                return json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:
-                return {}
-        return {}
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        # Migration pass — stamp version on pre-versioned files; run any
+        # registered migrations for older versions up to current.
+        version = detect_version(raw)
+        raw = migrate_if_needed(
+            raw, version, CURRENT_REVISE_HISTORY_VERSION,
+            schema="revise_history",
+        )
+        return raw
 
     def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Always stamp current version on every write — keeps the file
+        # self-describing even if it started life pre-versioning.
+        stamp(self._data, CURRENT_REVISE_HISTORY_VERSION)
+        atomic_write_text(
+            self.path,
+            json.dumps(self._data, indent=2, ensure_ascii=False),
+        )
 
     def _key(self, agent_key: str, reason: str, target_type: str) -> str:
         return f"{agent_key}:{target_type}:{_fingerprint(reason)}"
@@ -88,12 +109,12 @@ class ReviseHistory:
         pass_key = f"__pass__{agent_key}"
         patterns = self._data.get(pass_key, {}).get("patterns", [])
         # Only consider patterns seen >= 2 times (consistent, not one-off)
-        sin_patterns = [p for p in patterns if p["count"] >= 2]
-        if not sin_patterns:
+        consistent_patterns = [p for p in patterns if p["count"] >= 2]
+        if not consistent_patterns:
             return None
 
         addition_words = set(re.findall(r"\b\w{4,}\b", addition.lower()))
-        for p in sin_patterns:
+        for p in consistent_patterns:
             pattern_words = set(re.findall(r"\b\w{4,}\b", p["sample"].lower()))
             overlap = addition_words & pattern_words
             # If addition shares >50% words with a PASS pattern → likely conflict
@@ -102,7 +123,7 @@ class ReviseHistory:
         return None
 
     def get_pass_patterns(self, agent_key: str) -> list[dict]:
-        """Return sin PASS patterns for an agent (count >= 2)."""
+        """Return consistent PASS patterns for an agent (count >= 2)."""
         patterns = self._data.get(f"__pass__{agent_key}", {}).get("patterns", [])
         return [p for p in patterns if p["count"] >= 2]
 
@@ -188,7 +209,28 @@ class ReviseHistory:
         )
 
     def is_blacklisted(self, agent_key: str, reason: str, target_type: str) -> bool:
-        return self._data.get(self._key(agent_key, reason, target_type), {}).get("failed", False)
+        entry = self._data.get(self._key(agent_key, reason, target_type), {})
+        if not entry.get("failed", False):
+            return False
+        # Decay: un-blacklist if enough time has passed since it failed.
+        failed_at = entry.get("failed_at", "")
+        if failed_at:
+            try:
+                from datetime import timezone
+                dt = datetime.fromisoformat(failed_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                if (now - dt).days >= BLACKLIST_DECAY_DAYS:
+                    # Let it try again — context may have changed.
+                    entry["failed"] = False
+                    entry["unblocked_at"] = datetime.now().isoformat()
+                    entry["count"] = 0   # reset count; earn re-trust from scratch
+                    self._save()
+                    return False
+            except ValueError:
+                pass
+        return True
 
     def mark_applied(self, agent_key: str, reason: str, target_type: str,
                      backup_path: str = "", apply_session_id: str = ""):

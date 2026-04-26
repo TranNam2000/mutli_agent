@@ -17,20 +17,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+from core.paths import SKILLS_DIR as _SKILLS_DIR
 
 SCOPES = ["simple", "feature", "module", "full_app", "bug_fix"]
 
 # Keyword → scope mapping for heuristic detection (fast, no LLM)
 _SCOPE_KEYWORDS: dict[str, list[str]] = {
-    "bug_fix":  ["fix", "bug", "fix", "bug", "crash", "regression", "not working",
+    "bug_fix":  ["fix", "bug", "crash", "regression", "not working",
                  "doesn't work", "broken", "error in", "hotfix", "patch"],
     "full_app": ["full app", "toàn bộ app", "entire app", "end-to-end product",
                  "mvp", "platform", "app new", "new app", "ecosystem", "suite",
                  "nhiều module", "multi-module", "marketplace", "super app"],
     "module":   ["module", "domain", "cả phần", "entire feature set", "mini-app",
                  "dashboard", "admin panel", "onboarding flow", "full flow"],
-    "feature":  ["feature", "tính năng", "chức năng", "flow", "feature new",
+    "feature":  ["feature", "tính năng", "chức năng", "flow", "feature mới",
                  "new feature", "user story", "sprint"],
     "simple":   ["1 màn", "màn hình", "1 screen", "simple", "quick", "prototype",
                  "widget", "popup", "dialog", "component"],
@@ -47,9 +47,17 @@ def detect_scope(task: str, project_context: str = "") -> str:
     """
     text = (task + " " + project_context[:2000]).lower()
 
-    # Bug_fix wins immediately if any keyword matches
+    def _kw_count(kw: str, hay: str) -> int:
+        # Word-boundary match so "fix" doesn't hit "prefix/fixture",
+        # "bug" doesn't hit "debug", etc. (Unicode \w covers Vietnamese.)
+        return len(re.findall(rf"(?<!\w){re.escape(kw)}(?!\w)", hay))
+
+    # Bug_fix wins immediately if any keyword matches IN THE TASK itself
+    # (project_context hits are too noisy — code comments mention "fix"/"bug"
+    # all the time without the user intending a bug-fix scope).
+    task_lower = task.lower()
     for kw in _SCOPE_KEYWORDS["bug_fix"]:
-        if kw in text:
+        if _kw_count(kw, task_lower) > 0:
             return "bug_fix"
 
     # Otherwise, score each scope by keyword density
@@ -58,7 +66,7 @@ def detect_scope(task: str, project_context: str = "") -> str:
         if scope == "bug_fix":
             continue
         for kw in keywords:
-            scores[scope] += text.count(kw) * (len(kw.split()) + 1)
+            scores[scope] += _kw_count(kw, text) * (len(kw.split()) + 1)
 
     # File count hint from project context
     file_count = len(re.findall(r"^\s*###\s+", project_context, re.MULTILINE))
@@ -72,30 +80,62 @@ def detect_scope(task: str, project_context: str = "") -> str:
 
 
 def list_skills(agent_key: str) -> list[dict]:
-    """Return metadata for every skill available to this agent."""
+    """Return metadata for every skill available to this agent.
+
+    Scans `skills/<agent>/**/*.md` recursively so skills can be organised
+    into category subfolders (scope/, domain/, phase/, …). The skill_key
+    is still the file stem — duplicates across subfolders are not allowed
+    and the first hit wins (deterministic via sorted scan).
+    """
     agent_dir = _SKILLS_DIR / agent_key
     if not agent_dir.exists():
         return []
 
-    skills = []
-    for path in sorted(agent_dir.glob("*.md")):
+    skills: list[dict] = []
+    seen: set[str] = set()
+    # Subfolder paths (longer parts) sort AFTER flat files alphabetically, so
+    # walk depth-first to give subfolder versions precedence over root-level
+    # shims when both exist.
+    paths = sorted(agent_dir.rglob("*.md"), key=lambda p: (len(p.parts), str(p)))
+    paths.sort(key=lambda p: -len(p.parts))   # deeper first
+    for path in paths:
         if path.stem.startswith("_"):  # _detect.md, _registry.md…
             continue
+        # Skip "moved" shims left behind when we can't unlink files.
+        try:
+            head = path.read_text(encoding="utf-8")[:300]
+            if "MOVED_TO:" in head:
+                continue
+        except OSError:
+            continue
+        if path.stem in seen:
+            continue   # first hit (deeper path) wins
+        seen.add(path.stem)
         meta = _parse_skill_meta(path)
         meta["path"] = path
         meta["skill_key"] = path.stem
+        rel = path.relative_to(agent_dir).parent
+        meta["category"] = "" if str(rel) == "." else str(rel).replace("/", "·")
         skills.append(meta)
+    # Final sort: by category then key for stable menu ordering
+    skills.sort(key=lambda s: (s["category"], s["skill_key"]))
     return skills
 
 
 def _parse_skill_meta(path: Path) -> dict:
-    """Parse skill frontmatter: SCOPE, TRIGGERS, MAX_TOKENS, DEPENDS_ON."""
+    """Parse skill frontmatter: SCOPE, TRIGGERS, MAX_TOKENS, DEPENDS_ON, STEPS.
+
+    `STEPS` is optional — used by PM routing skills to declare the pipeline
+    sub-set this skill dispatches. When present, PMAgent uses it directly
+    and skips the LLM step picker (saves an LLM call per session).
+    """
     content = path.read_text(encoding="utf-8")
     meta: dict = {
         "scope":      [],
         "triggers":   [],
         "max_tokens": 4096,
         "depends_on": [],
+        "steps":      [],
         "content":    content,
     }
 
@@ -123,6 +163,9 @@ def _parse_skill_meta(path: Path) -> dict:
         elif s.upper().startswith("DEPENDS_ON:"):
             meta["depends_on"] = [v.strip().lower()
                                    for v in s.split(":", 1)[1].split(",") if v.strip()]
+        elif s.upper().startswith("STEPS:"):
+            meta["steps"] = [v.strip().lower()
+                              for v in s.split(":", 1)[1].split(",") if v.strip()]
 
     return meta
 
@@ -189,8 +232,8 @@ def llm_pick_skill(call_fn, agent_key: str, task: str, candidates: list[dict]) -
         for s in candidates
     )
     system = (
-        f"You is {agent_key} agent. Choose skill phù hợp nhất for task. "
-        "Chỉ trả về name skill_key, no giải thích."
+        f"You are the {agent_key} agent. Choose the most suitable skill for this task. "
+        "Return only the skill_key name, no explanation."
     )
     user = f"Task:\n{task[:600]}\n\nSkills có sẵn:\n{options}\n\nSkill_key nào?"
     try:
@@ -198,13 +241,13 @@ def llm_pick_skill(call_fn, agent_key: str, task: str, candidates: list[dict]) -
         for s in candidates:
             if s["skill_key"] in raw:
                 return s["skill_key"]
-    except Exception:
+    except (ValueError, KeyError, AttributeError, TypeError, IndexError):
         pass
     return candidates[0]["skill_key"]
 
 
 def format_metadata_summary(meta: dict | None) -> str:
-    """Render a compact metadata block for LLM prompts. Empty string if None."""
+    """Render a compact metadata block for LLM prompts. Empty string if none."""
     if not meta:
         return ""
     lines = []
@@ -263,12 +306,11 @@ def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
     user = f"Task:\n{task[:600]}\n{meta_block}\n\nSkills có sẵn:\n{options}"
     try:
         raw = call_fn(system, user, max_tokens=120)
-        import re as _re
-        m = _re.search(r"SKILLS:\s*(.+)", raw, _re.IGNORECASE)
+        m = re.search(r"SKILLS:\s*(.+)", raw, re.IGNORECASE)
         names_line = m.group(1) if m else raw
         picked: list[str] = []
         valid = {s["skill_key"] for s in candidates}
-        for part in _re.split(r"[,;\n]", names_line):
+        for part in re.split(r"[,;\n]", names_line):
             key = part.strip().strip("`").strip("'\"")
             if key in valid and key not in picked:
                 picked.append(key)
@@ -276,7 +318,7 @@ def llm_pick_skills_multi(call_fn, agent_key: str, task: str,
                 break
         if picked:
             return picked
-    except Exception:
+    except (ValueError, KeyError, AttributeError, TypeError, IndexError):
         pass
     return [candidates[0]["skill_key"]] if candidates else []
 

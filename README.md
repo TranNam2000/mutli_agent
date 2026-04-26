@@ -2,14 +2,15 @@
 
 > Autonomous multi-agent framework that turns a product idea or bug
 > report into shipped code — classifying the request, routing it through
-> specialized Claude agents (PM → BA → Design → TechLead → Dev → QA),
+> specialized Claude agents (PM → BA → Design → TechLead → Dev ∥ Test),
 > and teaching itself from every session's outcome.
 
-The killer feature is **cross-session learning**: every skip-Critic
-decision that later causes a QA failure is logged, every module that
-accumulates failures is blacklisted, every user rating is merged into
-the rule files — so the pipeline literally never repeats the same
-mistake twice.
+**Killer feature — cross-session learning.** Every skip-Critic decision
+that later causes a QA failure is logged, every module with persistent
+failures is blacklisted, every critic score is paired with the real
+outcome (test pass rate, clarification count, token ratio) so a
+pure-Python logistic regression can gate future rule changes by
+predicted regression probability — not by a hand-tuned counter.
 
 ---
 
@@ -19,13 +20,15 @@ mistake twice.
 - [Quick start](#quick-start)
 - [Pipeline flow](#pipeline-flow)
 - [PM router — 5 request kinds](#pm-router--5-request-kinds)
-- [Task metadata — the nervous system](#task-metadata--the-nervous-system)
-- [Fast-Track + Emergency Audit](#fast-track--emergency-audit)
+- [Scoring — critic + real outcomes](#scoring--critic--real-outcomes)
 - [Learning system](#learning-system)
 - [Skill system](#skill-system)
 - [User feedback](#user-feedback)
+- [CLI commands](#cli-commands)
 - [Environment variables](#environment-variables)
 - [Architecture](#architecture)
+- [Testing](#testing)
+- [Contributing](#contributing)
 - [When to use / when not to](#when-to-use--when-not-to)
 - [License](#license)
 
@@ -40,7 +43,8 @@ pip install -e .
 ```
 
 Requires Python ≥ 3.10 and the `claude` CLI installed + authenticated.
-Optional: `patrol`, `maestro`, `flutter`, `git`, `adb`, `rg`.
+Optional: `patrol`, `maestro`, `flutter`, `git`, `adb`, `rg` for richer
+integration tests and project detection.
 
 Run `mag --doctor` to verify every dependency at once.
 
@@ -49,607 +53,456 @@ Run `mag --doctor` to verify every dependency at once.
 ## Quick start
 
 ```bash
-# From any project folder
-cd ~/my_flutter_app
+# Interactive — paste an idea or a URL (Jira, Confluence, Google Docs…)
+python main.py
 
-# Build a feature
-mag "add Google OAuth login"
+# Direct — one-shot
+python main.py "add OAuth login with Google + Apple for existing Flutter app"
 
-# Fix a reported bug
-mag "fix Stripe checkout alignment on iPhone 15 Pro Max"
+# Maintain mode — explicit project dir (otherwise auto-detected)
+python main.py "fix crash when email empty" --maintain /path/to/project
 
-# Tweak UI only
-mag "change home screen padding + dark mode toggle"
+# Resume a session that hit quota or crashed
+python main.py --resume 20260422_144550_388d
 
-# Quick MVP with custom resources
-mag "build MVP video downloader" --dev-slots 3 --sprint-hours 100
+# Amend a finished session
+python main.py --update 20260422_144550_388d "add rate limit to login"
 
-# Resume a paused session
-mag --list
-mag --resume 20260419_180000_a3b2
-
-# Cross-session trend dashboard
-mag --trend
-
-# Rate a session to feed the learning loop
-mag feedback 20260419_180000_a3b2 --agent ba --rating 2 \
-    --comment "AC missed the offline-retry edge case"
+# Re-run with runtime feedback
+python main.py --feedback 20260422_144550_388d
 ```
 
-Every run writes `.multi_agent/sessions/<session_id>/REPORT.html` — a
-single-file dashboard with sparklines, radar charts, audit entries,
-and Maestro test thumbnails.
+A session produces checkpoints in `outputs/<project>/` or
+`<project>/.multi_agent/sessions/<session_id>/` — every agent's output,
+a Markdown conversation log, and a structured JSON export with token
+breakdown, review scores, and active skills.
 
 ---
 
 ## Pipeline flow
 
 ```
-Input (task / bug / URL)
-    │
-    ▼
-PM router ─── classifies into 5 kinds, stamps task.metadata.scope
-    │
-    ▼  (route dispatches a sub-pipeline — see table below)
-BA (task list)        ← emits ```json META``` per task
-    │
-    ▼
-Design (reuse-first)  ← maps UI tasks to existing design system when possible
-    │
-    ▼
-BA (consolidate)      ← merges design refs back into the task list
-    │
-    ▼
-TechLead              ← enrich_metadata(impact_area, risk_bump)
-    │                    prioritize + sprint pack
-    │                    conditional Critic (complexity/type/core-file)
-    │                    Option B spec review ──► asks BA for clarifications
-    │                                             when smell test flags tasks
-    ▼
-Dev ∥ Test (parallel) ← Dev Critic mandatory; QA plan in priority order
-    │
-    ▼
-QA → Dev fix loop ─── Patrol + Maestro + vision diff + logcat
-    │                    Option C postmortem ──► TL asks BA to rewrite spec
-    │                                             when Dev stuck 2 rounds
-    │   ┌─ BLOCKER on a task that had Critic skipped upstream? ──┐
-    │   │                                                         │
-    │   ▼                                                         │
-    │ 🚨 EMERGENCY AUDIT MODE                                      │
-    │   1. audit_log.jsonl records RCA entry                      │
-    │   2. Critic forced ON for the rest of the session           │
-    │   3. IntegrityRules mutate (module / keyword / reputation)  │
-    │   4. integrity.md regenerates                                │
-    └──────────────────────────────────────────────────────────────┘
-    │
-    ▼
-Learning system ──── 4-source merge (LLM + Integrity + User Feedback + Cost)
-    │                    provenance-tag every clause
-    │                    multi-dim score (correctness / consistency /
-    │                                       usability / cost)
-    │                    route: auto-apply / shadow A/B / pending
-    │                    evaluate live shadows → promote or demote
-    ▼
-HTML dashboard + committed code
+    ┌──────────┐       ┌──────────────────┐
+    │  Input   │──────▶│  PM router       │  classify + pick PM
+    │ (text/URL│       │  picks routing   │  routing skill → STEPS
+    │  /file)  │       │  skill via MODE: │  declared in skill md
+    └──────────┘       └─────────┬────────┘
+                                 │
+                                 ▼
+                       ┌─────────────────────┐
+                       │ PM CONFIRM GATE     │  Show user the plan
+                       │ Y/n/edit/show       │  before any LLM call
+                       └─────────┬───────────┘  on BA/Dev/QA/etc.
+                                 │
+                ┌────────────────┼────────────────┐
+                ▼                ▼                ▼
+            code_bugfix   code_uitweak       code_feature
+            dev,test      design,dev,test    full pipeline
+            
+            documentation     qa_audit       discovery_research
+            ba                investigation  ba (discovery skill)
+
+    Per agent step:
+      ┌──────────────────────────────────────────────────────┐
+      │ Agent runs claude CLI subprocess  cwd=project_root    │
+      │  → LLM sees:                                          │
+      │     • base rule + WORKING MODES menu (skills-as-menu) │
+      │     • cwd hint (native Read/Edit/Write available)     │
+      │     • GROUND RULE (anti-fabrication, 7 luật)          │
+      │  → LLM emits MODE:<skill> + reasoning                 │
+      │  → If unclear: ASK_USER:<question>                    │
+      │     pipeline pauses, prompts user, re-runs (max 2)    │
+      │  → If no skill matches: SkillDesigner auto-creates    │
+      │     into skills/<agent>/auto/<slug>.md                │
+      └──────────────────────────────────────────────────────┘
 ```
+
+Every edge is a real agent-to-agent message via `core.message_bus` — the
+bus now also provides `recent(agent, n=3)` so replies carry context
+from prior turns (reducing clarification cascades).
+
+**Anti-hallucination GROUND RULE** is injected on every LLM call:
+1. Read/Glob/Grep verify before claiming file/API exists
+2. No fabricated code samples — must compile in real project
+3. No fabricated facts — citations required (`path:line` format)
+4. Unsure → emit `MISSING_INFO: <gì> — MUST_ASK: <user|TL|BA>`
+5. Don't understand → emit `ASK_USER: <câu hỏi>`
+6. Tool error → accept + report, don't fabricate result
+7. Citations format: `lib/auth/oauth_service.dart:42`
 
 ---
 
-## PM router — 5 request kinds
+## PM router — skill-driven routing
 
-```
-feature       → BA → Design → TechLead → test_plan → Dev → Test   (full)
-bug_fix       → Dev → Test
-ui_tweak      → Design → Dev → Test
-refactor      → TechLead → Dev → Test
-investigation → InvestigationAgent only (direct Q&A, no build)
-```
+The PM agent has 12 routing skills under `skills/pm/routing/`. Each skill
+declares its `STEPS:` in frontmatter, so changing the flow = editing
+markdown, not Python:
 
-The router uses a keyword heuristic (Vietnamese diacritics aware)
-first; only falls back to an LLM call when the signal is genuinely
-mixed. When `confidence < 0.6` the CLI shows the candidates and asks
-the user to pick. Once a kind is chosen, it is stamped onto every
-task's `metadata.context.scope` — downstream gates, audit log, and the
-learning system all read from that single source of truth.
+| Skill                 | STEPS                                              | When to apply                       |
+|-----------------------|----------------------------------------------------|--------------------------------------|
+| `code_feature`        | ba → design → techlead → test_plan → dev → test    | Tính năng mới có code                |
+| `code_bugfix`         | dev → test                                         | Fix bug, không design                |
+| `code_uitweak`        | design → dev → test                                | Visual cosmetic (color/font/spacing) |
+| `documentation`       | ba                                                 | Viết doc, không code                 |
+| `qa_audit`            | investigation                                      | Đánh giá doc/code (read-only)        |
+| `discovery_research`  | ba (discovery skill)                               | User research / persona / JTBD       |
+| `prototype_demo`      | dev → test                                         | POC throwaway code                   |
+| `enterprise_b2b`      | full + RBAC checks                                 | SaaS B2B, multi-tenant               |
+| `hotfix_emergency`    | dev → test                                         | P0 production down                   |
+| `maintain_project`    | ba → dev → test (BA-lite)                          | Refactor/migrate code cũ             |
+| `startup_mvp`         | ba → design → tl → dev → test (skip test_plan)     | Lean MVP, ship fast                  |
+| `default`             | (LLM step picker)                                  | Fallback nếu skill nào không match   |
 
----
+PM picks the right skill via `MODE:` tag in its first reply. STEPS come
+straight from skill frontmatter — no separate LLM call to pick steps,
+saving ~800 tokens per session vs. legacy DISPATCH_PLAN approach.
 
-## Task metadata — the nervous system
-
-Every Task carries a structured metadata block embedded in the BA
-markdown as a ```` ```json META ```` fenced block:
-
-```json
-{
-  "task_id": "BUG-12345",
-  "context": {
-    "scope":      "feature | bug_fix | hotfix | refactor | ui_tweak",
-    "priority":   "P0 | P1 | P2 | P3",
-    "risk_level": "low | med | high",
-    "complexity": "S | M | L | XL"
-  },
-  "flow_control": {
-    "skip_critic":   ["PM", "BA", "TechLead"],
-    "require_qa":    true,
-    "max_revisions": 2
-  },
-  "technical_debt": {
-    "impact_area":     ["ui", "payment", "auth", "api", "..."],
-    "legacy_affected": false
-  }
-}
-```
-
-**Who fills what**
-
-| Field                          | Authoritative writer                        |
-|--------------------------------|---------------------------------------------|
-| `context.scope`                | **PM** (overrides any BA value post-parse)  |
-| `context.priority`             | BA                                          |
-| `context.complexity`           | BA, adjusted by TechLead                    |
-| `context.risk_level`           | BA, bumped by TechLead on core/payment/auth |
-| `technical_debt.impact_area`   | **TechLead** (`enrich_metadata` keywords)   |
-| `flow_control.skip_critic`     | BA (guided by the system prompt)            |
-
-**Decision helpers** used by the orchestrator's Critic gate:
-
-- `is_low_risk_small()` — `complexity=S AND risk_level=low`
-- `is_hot_p0()` — `scope=hotfix AND priority=P0`
-- `touches_core()` — `impact_area` contains `core | payment | auth | security`
-
-Legacy BA output (no META block) is handled by
-`learning.task_metadata.derive_from_task()`, which maps existing Task
-fields into a sensible default. No BC break.
+**PM confirm gate (default ON):** before dispatching agents, PM shows
+the user the plan (kind + skill + steps + reason) and asks
+`[Y]es / [n]o / [e]dit / [s]how`. Set `MULTI_AGENT_PM_AUTO_CONFIRM=1`
+in CI / non-interactive runs to skip.
 
 ---
 
-## Fast-Track + Emergency Audit
+## Scoring — critic + real outcomes
 
-Fast-Track is the default posture. By metadata-driven rules, Critic is
-**skipped** for PM / BA / Design / TechLead on low-risk small tasks,
-and **mandatory** for Dev + Test regardless. This cuts 30–40% of
-Critic LLM calls per session on average.
+Every Critic step emits a **3-dimension score** (completeness / format /
+quality) against a rubric checklist in `rules/<profile>/criteria/*.md`.
+Raw scores then pass through `analyzer.score_adjuster` which blends in
+**real-world signals**:
 
-If QA then surfaces a BLOCKER on a task that had Critic skipped
-upstream, **Emergency Audit Mode** fires:
+1. **Scope reweight** — `simple` / `feature` / `full_app` have different
+   dimension weights.
+2. **Test outcomes** — Patrol + Maestro pass-rate blended via weighted
+   sum (never compound subtraction, so a score can't crash from 8 → 1).
+3. **Upstream attribution** — when Dev output has
+   `MISSING_INFO: ... MUST_ASK: BA`, ~70 % of the test-fail pressure
+   moves onto BA (Dev always keeps ≥ 30 %).
+4. **Downstream signals** — clarification count + MISSING_INFO leakage.
+5. **Cost penalty** — `used / expected_budget` ratio.
 
-1. `audit_log.jsonl` records the RCA entry (predicted metadata vs
-   actual outcome, which roles were skipped, first blocker string).
-2. `self._emergency_audit = True` — every subsequent step in this
-   session forces Critic on, no exceptions.
-3. The offending task is bumped to `risk_level=high` in memory and its
-   `skip_critic` list is cleared.
-4. `IntegrityRules.record_failure()`:
-   - `module_blacklist[area] += 1`
-   - `agent_reputation[role].false_negatives += 1` (and starts a
-     forced-Critic window of 5 tasks on the Nth offense)
-   - `keyword_risk[matched]` promoted to `med` / `high`
-5. `rules/<profile>/integrity.md` is regenerated with the new state.
+A final "receipt" prints at session end:
 
-The next session loading this profile sees the updated blacklist,
-reputation, and keyword risks — and routes around the landmine
-automatically.
+```
+  Developer score:  8  (critic raw)
+    − 3.0  Patrol tests fail 30%
+    − 2.0  2 MISSING_INFO leaked downstream
+    ───────────────────────────────────────
+    = 5  final
+```
 
-### TechLead conditional Critic
-
-Even inside Fast-Track, TechLead's output is critiqued whenever:
-
-| Signal                                       | Critic |
-|----------------------------------------------|--------|
-| `MULTI_AGENT_TL_CRITIC_ALWAYS=1`             | RUN    |
-| `MULTI_AGENT_TL_CRITIC_NEVER=1`              | SKIP   |
-| any task has `complexity=L | XL`             | RUN    |
-| any task has `type=bug | hotfix`             | RUN    |
-| all tasks `complexity ∈ {S, M}` on non-bug   | SKIP   |
-| output mentions `main.dart | app_router | service_locator | Base*` | RUN |
-| otherwise                                    | SKIP   |
+Every (critic_raw, signals) tuple is appended to
+`rules/<profile>/.learning/score_correlation.jsonl`. Run
+`mag validate-rubric` after ≥ 3 sessions to see Pearson correlation
+between the critic rubric and each real signal — if `|r| < 0.3`, the
+rubric isn't predicting reality.
 
 ---
 
 ## Learning system
 
-One unified loop, default ON. Replaces the legacy
-auto-apply-on-repeat path (kept behind `MULTI_AGENT_LEGACY_RULE_OPTIMIZER=1`
-as a debug escape hatch).
+Three conceptually-separate layers:
 
-### Four signal sources merged every session
+### 1. **IntegrityRules** (always on)
 
-1. **LLM analysis** of Critic REVISE patterns (`RuleOptimizerAgent`)
-2. **IntegrityRules tables** — module blacklist, keyword risk, agent
-   reputation (zero-token deterministic suggestions)
-3. **User feedback** via `mag feedback` (highest source weight)
-4. **Cost signals** — per-agent token spend vs metadata-driven expected
-   budget, evaluated across a rolling 5-session window
+Observes failures → promotes modules / keywords / agents to higher-risk
+buckets → forces Critic on for matching tasks in future sessions.
+Deterministic, no LLM cost.
 
-### Provenance
+### 2. **RuleEvolver** (default: propose)
 
-Every clause appended to a rule file carries an inline HTML comment:
+Merges four signal sources (LLM suggestions, integrity findings, user
+feedback from `mag feedback`, cost overages) into a unified decision
+stream with multi-dim scoring. Routes each suggestion to one of three
+lanes:
 
-```markdown
-<!-- provenance: src=llm+integrity+user session=20260420_abcd ts=2026-04-20T06:31:12 score=0.87 -->
-- Tasks touching `payment` MUST set risk_level=high and MUST NOT list
-  BA / TechLead / PM in flow_control.skip_critic.
-```
+- **auto-apply** — ≥ 3 consensus sources AND multi-dim ≥ 0.80
+- **shadow A/B** — multi-dim ∈ [0.60, 0.80); gated behind
+  `SHADOW_AB_MIN_TOTAL_SESSIONS = 30`
+- **pending** — multi-dim < 0.60; surfaced to user for review
 
-`learning.rule_evolver.parse_provenance_from_rule()` reads these markers
-back for audit and `mag --trend` rendering.
+### 3. **Regression classifier** (kicks in after ≥ 30 samples)
 
-### Multi-dim scoring
+Pure-Python logistic regression trained on historical apply →
+regression labels. Replaces the old "count ≥ 5" gate with a
+context-aware `P(regress)` probability:
 
-Every suggestion is scored across four dimensions:
+- `P(regress) < 0.20` → auto-apply
+- `< 0.50` → shadow
+- else → skip
 
-| Dimension      | Weight | Meaning                                     |
-|----------------|--------|---------------------------------------------|
-| correctness    | 0.40   | Does it actually reduce errors?             |
-| consistency    | 0.30   | Does it contradict / duplicate existing?    |
-| usability      | 0.15   | Does it reduce downstream clarifications?   |
-| cost           | 0.15   | Does it avoid token bloat?                  |
+Run `mag rubric-classifier` to see the current feature weights. Training
+happens automatically once per session (< 200 ms for 40 samples).
 
-Consensus boost: when ≥ 2 sources propose the same change, the final
-score is multiplied by up to 1.2×.
+### Learning modes
 
-### Lane routing
+Set `MULTI_AGENT_LEARNING_MODE` to one of:
 
-| Lane        | Condition                               | Action                              |
-|-------------|-----------------------------------------|-------------------------------------|
-| **auto**    | score ≥ 0.80 AND ≥ 3 consensus sources  | Append to rule file now             |
-| **shadow**  | score ∈ [0.60, 0.80)                    | Write `<agent>.shadow.md`, A/B test |
-| **pending** | score < 0.60                            | Queue for user review               |
+- `propose` (default) — every suggestion surfaced; user confirms each
+- `auto` — classifier gate makes the decision
+- `off` — skip learning loop entirely
 
-### Statistical shadow A/B
-
-Shadow rule variants don't promote on demo-grade thresholds. A verdict
-is only rendered when all of:
-
-- **≥ 10 sessions per variant** accumulated
-- **Variance ≤ 1.5 stddev** in both (else noise dominates)
-- **max(baseline_avg, shadow_avg) ≥ 7.0** quality floor (so promoting
-  isn't just "less bad")
-- Delta beats **both** 1.0 absolute AND 2 × pooled SEM (≈ 95% CI)
-
-Then:
-
-- shadow − baseline ≥ threshold → **PROMOTE** (shadow replaces
-  baseline; old baseline archived as `<agent>.rejected.md`)
-- shadow − baseline ≤ −threshold → **DEMOTE** (shadow deleted)
-- otherwise → keep testing
-
-Rejected comparisons carry a `reject_reason` field for audit
-(insufficient samples / high variance / below quality floor).
-
-### Adaptive cost signal
-
-Rather than a flat token threshold, the system derives expected spend
-from the current task batch's metadata:
-
-```
-expected_tokens(agent) = Σ EXPECTED_BUDGET[(agent, task.scope, task.complexity)]
-                              for each task in the current batch
-```
-
-A cost-driven rule suggestion is emitted only when BOTH:
-
-1. `actual / expected ≥ 1.5×` this session
-2. ≥ 3 of the last 5 sessions also ≥ 1.5×
-
-Per-agent ratio history lives in
-`rules/<profile>/.learning/cost_history.json`. Users can override the
-defaults by writing `rules/<profile>/.learning/cost_budgets.json`:
-
-```json
-{
-  "dev|feature|XL": 50000,
-  "test|feature|XL": 30000
-}
-```
-
-Legitimate XL work (Dev spending 40k on a full-app task) is never
-flagged as over-budget. Only consistent output bloat across several
-sessions triggers a "trim output" clause — tagged `src=cost` provenance.
-
-### TL ↔ BA feedback loops
-
-The learning signal is not purely post-session. Two in-session loops
-catch bad specs before Dev wastes a round:
-
-- **Option B — proactive batch review**. Right after BA produces
-  tasks, TechLead runs a regex smell test on every task. Red flags:
-  - `len(acceptance_criteria) < 2`
-  - description < 80 chars
-  - `MISSING_INFO` still present
-  - vague phrasing ("as usual", "works normally", "như thường")
-  - Context Cohesion: task mentions a library (Firebase, Stripe,
-    Riverpod, Sentry, next-auth, Prisma, 38 total…) that isn't in the
-    project's declared dependencies
-  - hotfix task with zero AC
-  - core-area + L / XL complexity
-  
-  When any fires, TL sends ONE consolidated question to BA (a single
-  LLM call) and patches the answers back into each task's AC and
-  description. Spec-clean sessions pay zero tokens.
-
-- **Option C — reactive postmortem**. If the QA→Dev fix loop surfaces
-  the same BLOCKER in two consecutive rounds, TL asks BA to reflect on
-  whether the spec itself was incomplete. BA rewrites the affected
-  tasks (preserving unaffected ones verbatim), and Dev re-implements
-  using the refined spec. Guarded by `_ba_postmortem_fired` so it
-  fires at most once per session.
-
-### Meta-learning triggers (cross-session)
-
-| Trigger                                             | Action                                     |
-|-----------------------------------------------------|--------------------------------------------|
-| Applied rule causes score drop ≥ 0.5 (2+ sessions)  | Auto-rollback + blacklist pattern          |
-| Agent avg ≥ 8.5 for 3 consecutive sessions          | Auto-upgrade PASS_THRESHOLD +1             |
-| Skill avg < 5.0 across ≥ 5 uses                     | Auto-deprecate (if other skills exist)     |
-| Skill stuck in 5-7 band across 4+ uses              | Auto-refine via shadow A/B                 |
-| Chronic misfit pattern ≥ 4 sessions                 | Auto-create new shadow skill               |
-| Two skills with ≥ 70% trigger overlap               | Auto-merge candidate                       |
-| Module accumulates ≥ 3 post-skip failures           | `module_blacklist` → force Critic          |
-| Agent accumulates ≥ 2 false-negatives               | `agent_reputation` force-Critic window 5   |
-| Keyword appears in ≥ 1 failure blocker              | `keyword_risk` promote to med/high         |
+Plus `--dry-run-learning` to preview without writing, and
+`--auto-apply-learning` for CI runs.
 
 ---
 
 ## Skill system
 
-30 specialized skill files across six agents. The orchestrator picks
-one (or more) per session via keyword heuristic first; LLM fallback
-when the signal is mixed.
+Each agent has skill files under `skills/<agent>/<category>/<skill>.md`,
+organised on 3 axes:
 
-**Axes of differentiation**
+- **Language** — `dev/dart/`, `dev/typescript/`, `dev/python/`, `dev/kotlin/`,
+  same for `techlead/`. Drop a `.md` file in any subfolder — `list_skills()`
+  scans recursively.
+- **Scope** — `simple_feature` / `feature_module` / `full_product`
+- **Domain / phase / type** — `domain/ecommerce`, `phase/discovery`,
+  `task/bug_fix`, `routing/code_feature`, etc.
+
+Total: 38 skills across 6 agents (BA 8, Dev 8, TechLead 8, Test 5,
+Design 3, PM 12).
+
+### Skills as menu — LLM self-pick
+
+System prompt for each agent contains a `WORKING MODES` menu listing
+every available skill (frontmatter + 280-char summary). The LLM reads
+the menu, picks one via `MODE: <skill_key>` on the first reply line.
+No separate Python picker call — saves ~800 tokens per agent per session.
 
 ```
-                 ┌── agent    (6): PM / BA / Design / TL / Dev / Test
-                 │
- each skill      ├── scope    (5): simple / bug_fix / feature / module / full_app
-  tagged with    │
-                 ├── stack    (n): Flutter / React Native / Next.js / NestJS
-                 │
-                 ├── domain   (n): e-commerce (more over time)
-                 │
-                 └── mode     (n): startup_mvp / maintain_project / hotfix_emergency
+You are Developer.
+[base rule]
+---
+## WORKING MODES
+### `cubit_feature`
+- scope: feature
+- triggers: cubit, bloc, state management
+[280-char summary…]
+### `widget_only`
+[…]
+---
+[user task]
 ```
 
-**Multi-skill** — agents can activate up to `MULTI_AGENT_SKILL_MAX`
-skills at once. The default heuristic picker keeps a secondary only
-when its score ≥ 70 % of the primary. Set `MULTI_AGENT_SKILL_LLM=1` to
-let Claude pick 1 to MAX skills per step (adds ~5k tokens/session but
-understands cross-concern tasks like NestJS + e-commerce).
+LLM emits `MODE: cubit_feature` → base_agent records into
+`_skill_usage_log` with `method=llm_self`. If the LLM forgets the tag,
+fallback keyword scorer picks best-match skill (`method=fallback_keyword`).
 
-When metadata is available (TL / Design / Dev / Test steps), the LLM
-picker receives a compact summary — scope / max_risk / max_complexity /
-impact_area / integrity alerts / emergency_audit flag — so it can
-route on semantic signals rather than keyword text.
+### Auto-create when no skill matches
+
+When neither the menu nor the keyword fallback finds a match, base_agent
+calls SkillDesigner to draft a fresh skill on the fly into
+`skills/<agent>/auto/<slug>.md`. Default ON; opt out via
+`MULTI_AGENT_AUTO_CREATE_SKILL=0`.
+
+### Self-improving (cross-session)
+
+After ≥ 4-5 uses, `learning.skill_runner` has enough outcome data to:
+
+- **REFINE** mid-score skills (5-7 avg) — SkillDesigner rewrites shadow
+- **CREATE** new skills for chronic misfit patterns
+- **MERGE** near-duplicates (trigger overlap ≥ 70 %)
+- **DEPRECATE** consistently underperforming skills (< 5 avg across ≥ 5 uses)
+
+A/B promotion requires the shadow to beat its parent by ≥ 0.5 score
+margin across ≥ 2 sessions.
 
 ---
 
 ## User feedback
 
-Close the learning loop with one command:
-
 ```bash
-mag feedback 20260420_063112_abcd \
-    --agent ba \
-    --rating 2 \
-    --comment "AC missed the offline-retry edge case"
+mag feedback <session_id> --rating 4 \
+    --comment "login works but password reset email never arrives"
 ```
 
-Entries land in `rules/<profile>/.feedback/<session_id>.jsonl`. On the
-next session, `RuleEvolver.FeedbackStore.suggestions_from_feedback()`
-aggregates low-rating comments per agent and emits `SRC_USER`-tagged
-rule-ADD suggestions — which carry the highest source weight in the
-multi-dim scorer.
+Writes to `rules/<profile>/.feedback/<session_id>.jsonl`. On the next
+session, the evolver picks this up as a **high-trust signal** (weight
+1.0 vs 0.6 for LLM) and surfaces it for review. Your feedback is the
+single strongest input.
 
-Rating values: 1 (very bad) to 5 (very good). Agents with mean rating
-≥ 3.5 are left alone; below that, a tighten-behaviour clause is
-proposed with the digest of the recent low-rating comments.
+---
+
+## CLI commands
+
+| Command | What it does |
+|---------|-------------|
+| `python main.py "idea"` | Run full pipeline on a new request |
+| `python main.py --resume <id>` | Continue a session from checkpoint |
+| `python main.py --update <id> "change"` | Amend a finished session |
+| `python main.py --feedback <id>` | Replay with runtime feedback injected |
+| `python main.py --list` | List resumable sessions |
+| `python main.py --profiles` | List available rule profiles |
+| `python main.py --doctor` | Verify environment (Python, claude CLI, git…) |
+| `python main.py --check-arch` | Run architecture compliance audit (§12 rules) |
+| `python main.py status` | Health snapshot (shadow tests, reputation, cost trend) |
+| `python main.py validate-rubric` | Pearson correlation between critic score and real outcomes |
+| `python main.py rubric-classifier` | Training status + feature weights of P(regress) gate |
+| `python main.py undo <id>` | Revert rule changes from a specific session |
+| `python main.py --trend` | Cross-session score trends per agent |
+| `mag feedback <id> --rating N --comment "…"` | Structured post-run feedback |
+
+Short flags:
+
+- `--dry-run-learning` — preview rule changes, don't apply
+- `--auto-apply-learning` — CI mode, no prompts
+- `--budget 800000` — override token budget
+- `--reselect-plan` — re-pick Claude subscription plan
 
 ---
 
 ## Environment variables
 
-All are optional.
+All variables go through `core.config` (no stray `os.environ.get`
+anywhere in the codebase — enforced by `scripts/check_architecture.py`).
 
-```bash
-# Pipeline basics
-export MULTI_AGENT_FLOW=task-based          # pipeline variant
-export MULTI_AGENT_MAX_CONCURRENT=3         # parallel Claude calls
-export MULTI_AGENT_CALL_SPACING_MS=100      # min ms between calls
-export MULTI_AGENT_AUTO_COMMIT=1            # auto-commit Dev step
-export MULTI_AGENT_NO_AUTO_FEEDBACK=0       # skip post-build Maestro/logcat
-export MULTI_AGENT_AUTO_HEAL=1              # auto re-run on BLOCKERs
-export MULTI_AGENT_SKILL_REVIEW=0           # 1 = prompt before writing new skills
-
-# Critic gating
-export MULTI_AGENT_CRITIC_ALL=0             # 1 = Critic everywhere (legacy)
-export MULTI_AGENT_TL_CRITIC_ALWAYS=0       # 1 = always Critic TechLead
-export MULTI_AGENT_TL_CRITIC_NEVER=0        # 1 = never Critic TechLead (cheapest)
-
-# Learning system
-export MULTI_AGENT_LEGACY_RULE_OPTIMIZER=0  # 1 = pre-RuleEvolver path (debug)
-
-# Skill selection
-export MULTI_AGENT_SKILL_LLM=0              # 1 = Claude picks skills (~5k tok)
-export MULTI_AGENT_SKILL_MAX=2              # cap active skills (1 = single)
-```
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `MULTI_AGENT_LEARNING_MODE` | `propose` | `propose` \| `auto` \| `off` |
+| `MULTI_AGENT_LEARNING_DRY_RUN` | `0` | `1` = preview only |
+| `MULTI_AGENT_SHADOW_AB_FORCE` | `0` | Bypass ≥ 30-session gate |
+| `MULTI_AGENT_SKILL_HEURISTIC` | `0` | `1` = opt-out, dùng keyword scorer (default: LLM picks via MODE: tag) |
+| `MULTI_AGENT_SKILL_MAX` | `2` | Max active skills per agent (1-3) |
+| `MULTI_AGENT_PM_AUTO_CONFIRM` | `0` | `1` = skip PM `[Y/n]` plan-confirm gate (CI mode) |
+| `MULTI_AGENT_AUTO_CREATE_SKILL` | `1` | `0` = disable SkillDesigner auto-draft when no match |
+| `MULTI_AGENT_AUTO_COMMIT` | `1` | Auto-commit Dev output to branch |
+| `MULTI_AGENT_MAX_CONCURRENT` | `3` | Cap concurrent Claude calls (1-16) |
+| `MULTI_AGENT_CALL_SPACING_MS` | `100` | Minimum gap between call starts |
+| `MULTI_AGENT_CRITIC_ALL` | `0` | `1` = force Critic on every step |
+| `MULTI_AGENT_SKILL_REVIEW` | `0` | `1` = manual review before skill create/merge |
+| `MULTI_AGENT_RULE_CONFIRM` | `0` | `1` = extra confirm in evolver apply |
+| `MULTI_AGENT_LEGACY_RULE_OPTIMIZER` | `0` | Fallback to old classifier loop |
+| `MULTI_AGENT_TL_CRITIC_ALWAYS/_NEVER` | `0` | Force Critic on/off for TechLead |
+| `MULTI_AGENT_NO_AUTO_FEEDBACK` | `0` | Skip auto-feedback collection |
+| `MULTI_AGENT_AUTO_HEAL` | `1` | Auto-heal broken health check |
+| `MULTI_AGENT_DEBUG` | `0` | Verbose error logging |
 
 ---
 
 ## Architecture
 
+The project follows a strict layered architecture enforced by
+`scripts/check_architecture.py` (runs in CI):
+
 ```
-multi_agent/
-├── main.py                   CLI entry; mag run / --resume / --trend / feedback
-├── orchestrator.py           Pipeline core: PM router, sub-pipeline dispatch,
-│                             Fast-Track gate, Emergency Audit Mode, Rule A/B
-│                             variant activation, shadow score logging
-├── agents/
-│   ├── pm_agent.py           Router: 5 kinds + dispatch plan + scope stamp
-│   ├── ba_agent.py           Task producer (emits ```json META```)
-│   ├── techlead_agent.py     enrich_metadata + B batch review + prioritize
-│   ├── design_agent.py       Reuse-first design; process_ui_tasks
-│   ├── dev_agent.py          Implementation + revise + widget-key injection
-│   ├── test_agent.py         QA plan + review + loop
-│   ├── critic_agent.py       3-level grading (FULL / PARTIAL / MISS)
-│   ├── rule_optimizer_agent  LLM suggestions + suggest_from_integrity
-│   ├── skill_designer_agent  Shadow skill creation
-│   └── investigation_agent   Codebase Q&A (for kind=investigation)
-│
-├── core/                     message_bus / token_tracker / doctor /
-│                             plan_detector
-│
-├── context/                  project_detector / scoped_reader / git_helper /
-│                             health_check / context_builder
-│
-├── learning/
-│   ├── task_models.py         Task dataclass + parse_tasks + emit META
-│   ├── task_metadata.py       TaskMetadata + derive_from_task + render/parse
-│   ├── audit_log.py           JSONL writer, session + profile-level aggregate
-│   ├── integrity_rules.py     module blacklist / keyword risk / reputation
-│   ├── rule_evolver.py        RuleEvolver: 4-source merge, provenance,
-│   │                          multi-dim scoring, shadow A/B, feedback store
-│   ├── skill_selector.py      select_skills, multi-skill + LLM picker
-│   ├── skill_optimizer.py     skill shadow A/B + deprecate + merge
-│   ├── revise_history.py      score trend, regression detection, rollback
-│   └── score_adjuster.py      cost + clarification + test-outcome penalties
-│
-├── testing/                   patrol_runner / maestro_runner / stitch_browser /
-│                              auto_feedback
-├── reporting/                 html_report / trend_report
-│
-├── rules/<profile>/
-│   ├── pm.md / ba.md / techlead.md / dev.md / test.md / design.md
-│   ├── critic.md / rule_optimizer.md / skill_designer.md / test_plan.md / test_review.md
-│   ├── <agent>.shadow.md      Rule A/B variant (auto-managed by RuleEvolver)
-│   ├── <agent>.rejected.md    Archived loser of A/B (auto-managed)
-│   ├── criteria/<agent>.md    PASS_THRESHOLD + WEIGHTS + checklist
-│   ├── integrity.md           Auto-generated IntegrityRules summary
-│   ├── .learning/
-│   │   ├── module_blacklist.json
-│   │   ├── keyword_risk.json
-│   │   ├── agent_reputation.json
-│   │   ├── cost_history.json   rolling ratios per agent
-│   │   └── cost_budgets.json   user overrides (optional)
-│   ├── .feedback/              mag feedback <session>.jsonl entries
-│   ├── .audit/                 cross-session audit aggregate
-│   └── .shadow_log.json        rule A/B baseline vs shadow scores
-│
-└── skills/                    30 specialized skill files
-    ├── pm/           default + startup_mvp + maintain_project + hotfix_emergency
-    ├── ba/           simple_feature / feature_module / full_product /
-    │                 bug_fix / task_based / ecommerce
-    ├── design/       single_screen / feature_screens / design_system
-    ├── techlead/     simple_stateful / feature_bloc / full_app_arch /
-    │                 react_native_arch / nextjs_arch
-    ├── dev/          widget_only / cubit_feature / full_app_implementation /
-    │                 react_native / nextjs_app / nestjs_backend
-    └── test/         smoke_check / feature_tests / full_regression /
-                      jest_rtl / integration_api
+main.py → orchestrator.py (thin assembler, 766 lines)
+           ↓
+pipeline/ → agents/ → core/
+    ↓        ↓
+analyzer/ ← learning/ ← context/
 ```
+
+**Package responsibilities:**
+
+| Package | Contains |
+|---------|----------|
+| `core/` | Pure utilities: paths, logging, config, exceptions, text, message bus, tokens |
+| `session/` | Session ID, checkpoint I/O, conversation export |
+| `pipeline/` | Flow: task-based runner, critic loop, PM router, critic gating, clarification |
+| `analyzer/` | **Measure + predict:** outcome logger, score adjuster, classifier, cost history |
+| `learning/` | **Propose changes:** rule/skill runners, evolver, integrity, revise history |
+| `context/` | Project detection, maintain mode, git, file scanning |
+| `agents/` | One file per agent role; each subclasses `BaseAgent` |
+| `testing/` | Real test runners (Patrol, Maestro) + code output savers |
+| `reporting/` | HTML per-session + cross-session trend reports |
+| `scripts/` | Dev tooling (architecture checker, migrations) |
+| `tests/` | 92 pytest tests |
+
+**Cross-cutting — single source of truth:**
+
+- All paths via `core.paths.RULES_DIR`, `learning_dir(profile)`, etc.
+- All logging via `core.logging.tprint` (thread-safe)
+- All env vars via `core.config.get_bool`, `get_int`, `get_learning_mode`
+- Custom exceptions via `core.exceptions.AgentCallError`, `CheckpointCorrupt`, …
+
+See `CLAUDE.md` § 12 for the full rule list and documented exceptions.
+
+**Refactor journey:**
+
+- **orchestrator.py:** 3,439 → 766 lines (−78 %) across 10 phases
+- **Tests:** 0 → 92 pytest tests
+- **Modules added:** core/paths, core/logging, core/config, core/exceptions,
+  pipeline/task_based_runner, pipeline/critic_loop, pipeline/critic_gating,
+  pipeline/clarification, pipeline/pm_router, pipeline/session_runner,
+  analyzer/outcome_pipeline, analyzer/outcome_logger, analyzer/regression_classifier,
+  learning/rule_runner, learning/skill_runner, learning/trends,
+  learning/shadow_runner, session/conversation_export, context/maintain_detector,
+  testing/runners, scripts/check_architecture
 
 ---
 
-## Scoring mechanism (inside Critic)
+## Testing
 
-Every Critic-enabled agent output is graded against the skill's
-criteria file using three levels:
+```bash
+# All 92 tests
+python -m pytest tests/ -v
 
-| Grade       | Value | Meaning                                          |
-|-------------|-------|--------------------------------------------------|
-| **FULL**    | 1.0   | Fully done, good quality                         |
-| **PARTIAL** | 0.5   | Done but incomplete / shallow (≥ 50% but < 100%) |
-| **MISS**    | 0.0   | Fully missing or wrong                           |
+# Architecture compliance only
+python -m pytest tests/test_architecture.py
 
-Criteria files live in `rules/<profile>/criteria/<agent>.md`:
-
-```
-PASS_THRESHOLD: 7
-WEIGHTS: completeness=0.40 format=0.20 quality=0.40
-
-## Completeness (what must exist)
-- [ ] item 1
-- [ ] item 2
-
-## Format (structure rules)
-- [ ] item A
-
-## Quality (depth / usefulness)
-- [ ] item X
+# Mock claude CLI for unit tests — no real LLM calls
+# See tests/conftest.py for fixtures
 ```
 
-Final score:
+Test coverage:
 
-```
-dim_score = sum(grades) / total_items × 10        # per dimension
-final     = floor(c × Wc + f × Wf + q × Wq)
-verdict   = PASS if final ≥ PASS_THRESHOLD else REVISE
-```
+- **Pure functions** — parsers, score_adjuster math, outcome_logger
+  Pearson, regression classifier fit/predict
+- **Data classes** — session manager checkpoint, message bus recent()
+- **Flow** — critic_loop PASS/REVISE paths, PM fast-path gate
+- **Architecture** — boundaries, file sizes, cross-cutting violations
 
-Auto-penalties override the formula:
+The architecture test (`test_architecture.py`) runs
+`scripts/check_architecture.py` and fails CI on any violation — paths
+not via `core.paths`, local `tprint` definitions, raw env vars, or
+orchestrator exceeding 800 lines.
 
-- `MISSING_INFO` still in the output → quality capped at 4
-- Output shorter than 200 chars → quality capped at 3
+---
 
-Revise loop: on REVISE the agent gets `revision_guide` and retries up
-to 2 rounds. After 2 failed rounds the CLI prompts
-`[C]ontinue / [R]etry / [S]kip`.
+## Contributing
 
-### Score adjuster (post-pipeline)
+Before opening a PR:
 
-Critic scores can be gamed by checklist-satisfying output. The
-`ScoreAdjuster` blends critic score with real outcomes:
-
-- Patrol / Maestro test fails → penalty on Dev / Design
-- Downstream agent asks many clarifications → penalty on upstream
-- `MISSING_INFO` leaks into next step → penalty on the producer
-- Token usage wildly exceeds expected → penalty on all agents
-
-Dynamic weights by scope:
-
-| Scope      | completeness | format | quality |
-|------------|--------------|--------|---------|
-| simple     | 0.30         | 0.30   | 0.40    |
-| bug_fix    | 0.25         | 0.15   | 0.60    |
-| feature    | 0.35         | 0.20   | 0.45    |
-| module     | 0.40         | 0.20   | 0.40    |
-| full_app   | 0.45         | 0.15   | 0.40    |
-
-### Task priority score (during sprint packing)
-
-```
-priority_score = priority_weight × business_value_boost × risk_multiplier / √hours
+```bash
+python main.py --check-arch   # 0 violations
+python -m pytest tests/        # all pass
+python main.py --doctor        # environment OK
 ```
 
-| Field            | Values & multiplier                          |
-|------------------|----------------------------------------------|
-| priority         | P0=10, P1=6, P2=3, P3=1                      |
-| business_value   | critical=1.8, high=1.3, normal=1.0, low=0.6  |
-| risk             | low=1.0, med=1.3, high=1.7                   |
-| complexity hours | S=3, M=8, L=18, XL=40                        |
+See `CLAUDE.md` for conventions (§3) and architecture rules (§12).
 
-Higher score → earlier in sprint; topological sort enforces dependencies.
+**Common pitfalls already fixed — don't re-introduce:**
+
+- `import re` inside a function → hoist to top
+- `Path(__file__).parent.parent / "rules"` → use `core.paths.RULES_DIR`
+- `os.environ.get("MULTI_AGENT_*")` → use `core.config.get_bool/get_int`
+- `except Exception: pass` → narrow to specific types
+- Local `tprint` / `_tprint` → import from `core.logging`
+- `session_id.split("_", 2)` → suffix-match with `STEP_KEYS`
+- Compound score subtraction → use `ScoreAdjuster` blended sum
+- `from __future__ import annotations` must be the first import statement
 
 ---
 
 ## When to use / when not to
 
-**Use this pipeline when you want:**
-- AI to build a feature autonomously overnight / batched
-- Audit trail per AI output (compliance, post-mortem, debugging)
-- Cross-session learning — after N sessions the pipeline knows your
-  codebase's landmines
-- Consistent code quality across many features
+**Use when:**
 
-**Don't use it for:**
-- Real-time typing / assist — Cursor / Claude Code do that better
-- One-off 1-file scripts — over-engineered for trivial work
-- Projects without a stable codebase — IntegrityRules has nothing to
-  learn from
-- Teams that want a visual editor experience — CLI only today
+- Solo developer on a mobile / web product with ≥ 5 features to ship
+- Codebase large enough that grep-ing is painful
+- Willing to review generated code (it's Claude, not magic)
+- Want a traceable audit log of every LLM decision
+
+**Don't use when:**
+
+- < 100 LOC task — overhead > benefit
+- No test baseline — pipeline can't detect regressions
+- Non-mobile + non-web stack without Patrol/Maestro — test-outcome
+  signals won't work
+- Zero budget for Claude API / subscription
 
 ---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT — see `LICENSE`.

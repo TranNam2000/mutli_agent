@@ -18,7 +18,6 @@ WEIGHTS: completeness=0.30 format=0.20 quality=0.50
 - [ ] [Full] pubspec.yaml dependencies + DI / routes
 
 ## Format (structure)
-- [ ] Each file starts with comment: `// lib/path/to/file.dart`
 - [ ] Code ordered: data → logic → UI
 - [ ] No obvious syntax errors
 

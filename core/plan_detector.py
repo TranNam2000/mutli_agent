@@ -3,13 +3,12 @@ Detect Claude subscription plan and map to token budget for pipeline sessions.
 
 Priority:
   1. `claude auth status` → subscriptionType (if exposed in future CLI versions)
-  2. Cached forice in ~/.claude_pipeline.json
+  2. Cached choice in ~/.claude_pipeline.json
   3. Interactive plan selection → saved to cache
 """
 from __future__ import annotations
 import json
 import subprocess
-import os
 from pathlib import Path
 
 _CACHE_FILE = Path.home() / ".claude_pipeline.json"
@@ -37,19 +36,55 @@ PLAN_LABELS = {
 
 
 def _try_cli_plan() -> str | None:
-    """Try to read subscriptionType from `claude auth status`."""
+    """Try to read subscriptionType from `claude auth status`.
+
+    The CLI is not guaranteed to emit JSON — older/newer versions sometimes
+    print plain text, and `claude auth status` may not exist at all. We
+    handle each failure mode explicitly rather than swallowing silently:
+
+    * Missing binary / timeout → quietly return None (normal CI case)
+    * Non-zero exit code → quietly return None (auth missing → not fatal)
+    * JSON parse error → log once under DEBUG so we can spot CLI drift
+    * Unexpected schema → return None
+    """
+    from core.config import get_bool  # local import — plan_detector loaded very early
+    debug = get_bool("MULTI_AGENT_DEBUG")
     try:
         result = subprocess.run(
             ["claude", "auth", "status"],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            sub = data.get("subscriptionType")
-            if sub:
-                return sub.lower().strip()
-    except Exception:
-        pass
+    except FileNotFoundError:
+        return None                      # `claude` not installed — expected fallback
+    except subprocess.TimeoutExpired:
+        if debug:
+            print("  ⚠️  plan_detector: `claude auth status` timed out after 10s")
+        return None
+    except OSError as e:
+        if debug:
+            print(f"  ⚠️  plan_detector: OSError calling claude CLI: {e}")
+        return None
+
+    if result.returncode != 0:
+        return None                      # not logged-in or command not recognised
+
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        if debug:
+            preview = stdout[:120].replace("\n", " ")
+            print(f"  ⚠️  plan_detector: CLI did not return JSON (got: {preview!r})")
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    sub = data.get("subscriptionType")
+    if isinstance(sub, str) and sub.strip():
+        return sub.lower().strip()
     return None
 
 
@@ -57,7 +92,7 @@ def _load_cache() -> dict:
     try:
         if _CACHE_FILE.exists():
             return json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         pass
     return {}
 
@@ -67,7 +102,7 @@ def _save_cache(data: dict):
         existing = _load_cache()
         existing.update(data)
         _CACHE_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    except Exception:
+    except OSError:
         pass
 
 
@@ -102,7 +137,7 @@ def _ask_user_plan() -> tuple[str, int]:
 def detect_budget(force_reselect: bool = False) -> tuple[str, int]:
     """
     Return (plan_name, token_budget) using the best available source.
-    Caches user's forice — won't ask again on subsequent runs.
+    Caches user's choice — won't ask again on subsequent runs.
     """
     # 1. Try CLI auth status
     cli_plan = _try_cli_plan()
@@ -124,5 +159,5 @@ def detect_budget(force_reselect: bool = False) -> tuple[str, int]:
     plan, budget = _ask_user_plan()
     _save_cache({"plan": plan, "budget": budget})
     print(f"\n  ✅ Done lưu: {PLAN_LABELS.get(plan, plan)}  →  {budget:,} tokens/session")
-    print(f"     (Lưu tại {_CACHE_FILE}  |  --reselect-plan to tor đổi)")
+    print(f"     (Lưu tại {_CACHE_FILE}  |  --reselect-plan để thay đổi)")
     return plan, budget

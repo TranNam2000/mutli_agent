@@ -5,8 +5,6 @@ that agents can use when working on a maintenance/feature task.
 from __future__ import annotations
 import json
 import re
-import subprocess
-import os
 from pathlib import Path
 
 # Files/dirs to always skip
@@ -45,7 +43,7 @@ def _read_file(path: Path, max_chars: int = MAX_FILE_CHARS) -> str:
         if len(text) > max_chars:
             return text[:max_chars] + f"\n... [truncated, {len(text)} chars total]"
         return text
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 
@@ -121,7 +119,7 @@ def read_project(project_dir: str | Path, task_hint: str = "") -> str:
     """
     root = Path(project_dir).resolve()
     if not root.exists():
-        raise ValueError(f"Project dir no tồn tại: {root}")
+        raise ValueError(f"Project dir không tồn tại: {root}")
 
     # Extract keywords from task hint for smart prioritization
     task_keywords = [w.lower() for w in re.split(r"\W+", task_hint) if len(w) >= 4]
@@ -196,7 +194,7 @@ def detect_project_name(project_dir: str | Path) -> str:
         try:
             data = json.loads(pkg.read_text(encoding="utf-8"))
             name = data.get("name", "")
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError):
             pass
 
     gomod = root / "go.mod"

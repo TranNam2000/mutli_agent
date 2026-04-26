@@ -10,7 +10,6 @@ Output: outputs/<project>/<session>_REPORT.html — open in browser.
 """
 from __future__ import annotations
 import base64
-import json
 from datetime import datetime
 from pathlib import Path
 

@@ -16,6 +16,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.logging import tprint
+
 
 @dataclass
 class PatrolResult:
@@ -74,7 +76,7 @@ class PatrolRunner:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-        print(
+        tprint(
             "  ⚠️  Patrol CLI not yet cài. Cài bằng:\n"
             "     dart pub global activate patrol_cli\n"
             "     Thêm into pubspec.yaml dev_dependencies: patrol: ^3.0.0"
@@ -98,7 +100,7 @@ class PatrolRunner:
                 count=1,
             )
             pubspec.write_text(new, encoding="utf-8")
-            print("  ➕ Done thêm patrol into pubspec.yaml dev_dependencies")
+            tprint("  ➕ Done thêm patrol into pubspec.yaml dev_dependencies")
             subprocess.run(["flutter", "pub", "get"], cwd=self.project_dir, capture_output=True)
             return True
         return False
@@ -113,7 +115,7 @@ class PatrolRunner:
                 capture_output=True, text=True, timeout=30,
             )
             return json.loads(r.stdout) if r.stdout.strip() else []
-        except Exception:
+        except (json.JSONDecodeError, ValueError, KeyError):
             return []
 
     def find_device(self, platform: str) -> dict | None:
@@ -150,14 +152,14 @@ class PatrolRunner:
 
         device = self.find_device(platform)
         if not device:
-            print(f"  ❌ No có {platform} device — skip.")
+            tprint(f"  ❌ không có {platform} device — skip.")
             return None
 
         test_path = self.install_test_file(code)
         device_id = device.get("id", "")
         device_name = device.get("name", device_id)
 
-        print(f"  📱 [{platform.upper()}] Patrol chạy trên: {device_name}")
+        tprint(f"  📱 [{platform.upper()}] Patrol chạy trên: {device_name}")
 
         cmd = [
             "patrol", "test",

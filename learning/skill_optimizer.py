@@ -11,11 +11,13 @@ Storage: skills/.skill_history.json (per-profile).
 """
 from __future__ import annotations
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
-_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+from core.paths import SKILLS_DIR as _SKILLS_DIR
+from core.logging import tprint
 
 NEW_SKILL_THRESHOLD = 4       # ≥N sessions of misfit pattern → propose new skill
 DEPRECATE_THRESHOLD_AVG = 5.0 # avg score below this across ≥5 uses → deprecate
@@ -43,7 +45,7 @@ class SkillHistory:
         if self.path.exists():
             try:
                 return json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:
+            except (OSError, json.JSONDecodeError):
                 return {}
         return {}
 
@@ -313,9 +315,9 @@ class SkillOptimizer:
 
     def _load_agent_skills(self, agent_key: str) -> list[dict]:
         try:
-            from learning.skill_selector import list_skills
+            from pipeline.skill_selector import list_skills
             return list_skills(agent_key)
-        except Exception:
+        except (ImportError, ValueError, KeyError, AttributeError):
             return []
 
     @staticmethod
@@ -411,8 +413,10 @@ class SkillOptimizer:
         if not shadow_path.exists() or not parent_path.exists():
             return "missing_files"
 
-        # Copy shadow content into parent file
-        parent_path.write_text(shadow_path.read_text(encoding="utf-8"), encoding="utf-8")
+        # Atomic write: write to .tmp then replace to avoid corrupt state on crash
+        tmp_path = parent_path.with_suffix(".tmp")
+        tmp_path.write_text(shadow_path.read_text(encoding="utf-8"), encoding="utf-8")
+        os.replace(tmp_path, parent_path)
         # Retire shadow file
         shadow_path.rename(shadow_path.with_suffix(".retired.md"))
         self.history.mark_status(agent_key, shadow_key, "retired_promoted")
@@ -456,9 +460,9 @@ class SkillOptimizer:
     # ── Display ───────────────────────────────────────────────────────────────
 
     def print_stats(self):
-        print(f"\n  {'═'*60}")
-        print(f"  🎯 SKILL PERFORMANCE (profile: {self.profile})")
-        print(f"  {'═'*60}")
+        tprint(f"\n  {'═'*60}")
+        tprint(f"  🎯 SKILL PERFORMANCE (profile: {self.profile})")
+        tprint(f"  {'═'*60}")
         rows = []
         for key, entry in self.history._data.items():
             if ":" not in key or key.startswith("__"):
@@ -472,5 +476,5 @@ class SkillOptimizer:
         rows.sort(key=lambda r: (-r[2], r[3]))
         for agent, skill, uses, avg, pr in rows[:12]:
             icon = "✅" if avg >= 7 else ("⚠️ " if avg >= 5 else "❌")
-            print(f"  {icon} {agent:10} / {skill:30} uses={uses:3}  avg={avg:.1f}  pass={pr*100:.0f}%")
-        print(f"  {'─'*60}")
+            tprint(f"  {icon} {agent:10} / {skill:30} uses={uses:3}  avg={avg:.1f}  pass={pr*100:.0f}%")
+        tprint(f"  {'─'*60}")

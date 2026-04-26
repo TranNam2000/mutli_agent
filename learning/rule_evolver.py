@@ -30,8 +30,9 @@ Files touched
 """
 from __future__ import annotations
 import json
-import os
+import re
 import shutil
+import sys
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -99,8 +100,7 @@ def _score_consistency(addition: str, current_rule: str) -> float:
     add_lower = addition.lower()
     cur_lower = current_rule.lower()
     # Obvious contradiction: "must" + "must not" on same subject
-    import re as _re
-    must_tokens = _re.findall(r"must\s+not\s+\w+|must\s+\w+", add_lower)
+    must_tokens = re.findall(r"must\s+not\s+\w+|must\s+\w+", add_lower)
     for tok in must_tokens:
         negated = tok.replace("must not ", "must ") if "not" in tok else tok.replace("must ", "must not ")
         if negated in cur_lower:
@@ -224,7 +224,7 @@ class ShadowLog:
             return {"variants": {}}
         try:
             return json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return {"variants": {}}
 
     def _flush(self):
@@ -368,7 +368,7 @@ class FeedbackStore:
                     ts = datetime.fromisoformat(e.get("ts", "")).timestamp()
                     if ts >= cutoff:
                         out.append(e)
-                except Exception:
+                except (json.JSONDecodeError, ValueError, TypeError):
                     continue
         return out
 
@@ -476,19 +476,16 @@ class RuleEvolver:
 
         Returns {"applied": [...], "shadowed": [...], "pending": [...], "skipped": [...]}.
         """
-        import os as _os, sys as _sys
+        from core.config import get_bool
         if confirm is None:
-            confirm = (
-                _os.environ.get("MULTI_AGENT_RULE_CONFIRM", "0") == "1"
-                and _sys.stdout.isatty()
-            )
+            confirm = get_bool("MULTI_AGENT_RULE_CONFIRM") and sys.stdout.isatty()
         out = {"applied": [], "shadowed": [], "pending": [], "skipped": []}
         for s in suggestions:
             path = rule_path_resolver(s.agent_key, s.target_type)
             if s.lane == "auto":
                 if confirm:
                     try:
-                        from core.ux import show_diff_and_confirm
+                        from cli.ux import show_diff_and_confirm
                     except ImportError:
                         show_diff_and_confirm = None
                     if show_diff_and_confirm is not None:
@@ -544,13 +541,12 @@ class RuleEvolver:
 
 def parse_provenance_from_rule(rule_path: Path) -> list[dict]:
     """Scan a rule file for `<!-- provenance: ... -->` markers."""
-    import re as _re
     if not rule_path.exists():
         return []
     text = rule_path.read_text(encoding="utf-8")
-    pattern = _re.compile(
+    pattern = re.compile(
         r"<!--\s*provenance:\s*src=([^\s]+)\s+session=([^\s]+)\s+ts=([^\s]+)\s+score=([\d.]+)\s*-->",
-        _re.IGNORECASE,
+        re.IGNORECASE,
     )
     return [
         {"src": m.group(1), "session": m.group(2),

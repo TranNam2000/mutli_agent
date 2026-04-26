@@ -12,6 +12,7 @@ Everything lives here so main.py stays a thin dispatcher and the
 orchestrator/agent layers don't get contaminated with CLI concerns.
 """
 from __future__ import annotations
+import re
 import difflib
 import json
 import os
@@ -96,7 +97,7 @@ def status_report(profile: str = "default", rules_dir: Path | None = None) -> st
     lines.append(BOLD(YELLOW("🚨 IntegrityRules alerts")))
     try:
         from learning.integrity_rules import (
-            IntegrityRules, MODULE_BLACKLIST_THRESHOLD, REPUTATION_FN_THRESHOLD,
+            IntegrityRules, MODULE_BLACKLIST_THRESHOLD,
         )
         ir = IntegrityRules(profile_dir)
         shown = False
@@ -120,9 +121,7 @@ def status_report(profile: str = "default", rules_dir: Path | None = None) -> st
     # ── Agent reputation ─────────────────────────────────────────────────────
     lines.append(BOLD(YELLOW("🧠 Agent reputation")))
     try:
-        from learning.integrity_rules import (
-            IntegrityRules, REPUTATION_FN_THRESHOLD,
-        )
+        from learning.integrity_rules import IntegrityRules
         ir = IntegrityRules(profile_dir)
         if not ir.agent_reputation:
             lines.append(DIM("  (no false-negatives recorded — all clean)"))
@@ -157,8 +156,7 @@ def status_report(profile: str = "default", rules_dir: Path | None = None) -> st
                     pm_path = d / f"{d.name}_pm.md"
                     if pm_path.exists():
                         text = pm_path.read_text(encoding="utf-8", errors="ignore")
-                        import re as _re
-                        m = _re.search(r"\*\*Kind\*\*:\s*`([a-z_]+)`", text)
+                        m = re.search(r"\*\*Kind\*\*:\s*`([a-z_]+)`", text)
                         if m:
                             kind = m.group(1)
                     lines.append(f"  {d.name:30s}  kind={kind or '?':12s}")
@@ -327,7 +325,7 @@ def _load_yaml_minimal(path: Path) -> dict:
     """
     try:
         raw = path.read_text(encoding="utf-8")
-    except Exception:
+    except (OSError, UnicodeDecodeError, ValueError):
         return {}
 
     stack: list[tuple[int, dict]] = [(-1, {})]
@@ -451,7 +449,7 @@ def undo_session(session_id: str, profile: str = "default",
     try:
         ts_part = "_".join(session_id.split("_")[:2])
         session_ts = datetime.strptime(ts_part, "%Y%m%d_%H%M%S")
-    except Exception:
+    except ValueError:
         return {"restored": [], "missing": [f"unparseable session id: {session_id}"]}
 
     if not backup_dir.exists():
@@ -490,6 +488,94 @@ def undo_session(session_id: str, profile: str = "default",
             "missing":  [] if restored else ["no backups matched the session window"]}
 
 
+# ── Shadow A/B status report ─────────────────────────────────────────────────
+
+def shadow_status_report(profile: str = "default", rules_dir: Path | None = None) -> str:
+    """Render the live shadow A/B log: active variants + sample counts + delta
+    + verdict (promote / demote / continue).
+
+    This is the observability surface for rule A/B testing. Users ran
+    `mag shadow-status [--profile X]` to see whether anything the learning
+    loop registered as "shadowed" is converging.
+    """
+    if rules_dir is None:
+        from core.paths import RULES_DIR
+        rules_dir = RULES_DIR
+    profile_dir = Path(rules_dir) / profile
+    log_path    = profile_dir / ".shadow_log.json"
+
+    out: list[str] = []
+    out.append(BOLD(CYAN(f"\n🧪  Shadow A/B status — profile={profile}")))
+    out.append(DIM("   file: " + str(log_path)))
+
+    if not log_path.exists():
+        out.append(YELLOW("\n   No shadow log yet — no rule variants have been "
+                           "registered for A/B."))
+        out.append(DIM("   Tip: rules enter shadow when RuleEvolver scores them "
+                        "between auto-apply and pending thresholds."))
+        return "\n".join(out) + "\n"
+
+    # Lazy import so this module stays import-light for non-learning CLI paths.
+    try:
+        from learning.rule_evolver import ShadowLog
+        log = ShadowLog(profile_dir)
+    except (ImportError, ValueError, AttributeError) as e:
+        out.append(RED(f"\n   Failed to load shadow log: {e}"))
+        return "\n".join(out) + "\n"
+
+    verdicts = log.verdicts()
+    variants = log._data.get("variants", {})     # noqa: SLF001 — read-only
+
+    if not variants:
+        out.append(YELLOW("\n   0 active shadow variants."))
+        return "\n".join(out) + "\n"
+
+    # ── Summary line ────────────────────────────────────────────────────────
+    n_promote  = sum(1 for v in verdicts if v["verdict"] == "promote")
+    n_demote   = sum(1 for v in verdicts if v["verdict"] == "demote")
+    n_continue = sum(1 for v in verdicts if v["verdict"] == "continue")
+    n_waiting  = len(variants) - len(verdicts)
+    out.append("")
+    out.append(f"   Variants: {BOLD(str(len(variants)))}  "
+                f"│ promote={GREEN(str(n_promote))}  "
+                f"demote={RED(str(n_demote))}  "
+                f"continue={YELLOW(str(n_continue))}  "
+                f"waiting={DIM(str(n_waiting))}")
+    out.append("")
+
+    # ── Detail per variant ──────────────────────────────────────────────────
+    verdict_by_key = {v["key"]: v for v in verdicts}
+    for key, v in sorted(variants.items()):
+        n_b = len(v.get("baseline", []))
+        n_s = len(v.get("shadow",   []))
+        created = v.get("created_at", "-")
+        out.append(f"   ┌─ {BOLD(key)}  (created {created})")
+        out.append(f"   │  shadow_path: {DIM(v.get('shadow_path', '-'))}")
+        out.append(f"   │  samples   : baseline n={n_b}  │  shadow n={n_s}")
+
+        verdict = verdict_by_key.get(key)
+        if verdict is None:
+            out.append(DIM(f"   │  verdict   : (waiting — need more samples)"))
+        else:
+            color = (GREEN if verdict["verdict"] == "promote"
+                     else RED if verdict["verdict"] == "demote"
+                     else YELLOW)
+            avg_b = verdict["baseline_avg"]
+            avg_s = verdict["shadow_avg"]
+            delta = verdict["delta"]
+            out.append(f"   │  verdict   : {color(BOLD(verdict['verdict'].upper()))}")
+            out.append(f"   │  baseline  : avg={avg_b:.2f}  std={verdict['baseline_std']:.2f}")
+            out.append(f"   │  shadow    : avg={avg_s:.2f}  std={verdict['shadow_std']:.2f}")
+            sign = "+" if delta >= 0 else ""
+            out.append(f"   │  delta     : {sign}{delta:.2f}  "
+                        f"(sig threshold {verdict['sig_threshold']:.2f})")
+            if verdict.get("reject_reason"):
+                out.append(DIM(f"   │  note      : {verdict['reject_reason']}"))
+        out.append(f"   └─")
+    out.append("")
+    return "\n".join(out)
+
+
 # ── Interactive chat mode ────────────────────────────────────────────────────
 
 def chat_loop(run_pipeline_fn) -> None:
@@ -513,7 +599,7 @@ def chat_loop(run_pipeline_fn) -> None:
             print(DIM("bye."))
             return
 
-        # Classify up front so the user sees what PM will do.
+        # Classify up front so the user sees what PM sẽ làm.
         try:
             from agents.pm_agent import PMAgent
             pm = PMAgent(profile=os.environ.get("MAG_PROFILE", "default"))
@@ -559,11 +645,10 @@ def chat_loop(run_pipeline_fn) -> None:
             comment = input(BOLD(GREEN("▸ ")) + "Comment (optional): ").strip()
             # Find latest session id — lazy import to avoid circular.
             try:
-                from orchestrator import ProductDevelopmentOrchestrator as _O
                 # We don't have the instance here; fall back to telling user the CLI.
                 print(DIM("  Run: mag feedback <session_id> --agent general "
                           f"--rating {rating_raw} --comment \"{comment}\""))
-            except Exception:
+            except (ImportError, ValueError, AttributeError):
                 pass
 
         print()

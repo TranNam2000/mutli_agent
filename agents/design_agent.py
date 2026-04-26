@@ -1,4 +1,7 @@
 """Design Agent - UI/UX design specifications."""
+from __future__ import annotations
+import re
+from core.logging import tprint
 from .base_agent import BaseAgent
 
 
@@ -96,13 +99,12 @@ TASK-003 | REUSE | ListItemCard | reuse as-is"""
 
         try:
             raw = self._call(system, prompt)
-        except Exception:
+        except (ValueError, KeyError, AttributeError, TypeError):
             return {}
 
         result: dict[str, dict] = {}
-        import re as _re
         for line in raw.splitlines():
-            m = _re.match(
+            m = re.match(
                 r"\s*(TASK-[\w\-]+)\s*\|\s*(REUSE|CREATE)\s*\|\s*([^|]+?)\s*\|\s*(.+)",
                 line,
             )
@@ -135,14 +137,14 @@ EXTENSION_NOTES: [what to fix/extend if any]"""
         try:
             raw = self._call(system, prompt)
             reuse = "REUSE: YES" in raw
-            name_m = __import__("re").search(r"COMPONENT_NAME:\s*(.+)", raw)
-            ext_m  = __import__("re").search(r"EXTENSION_NOTES:\s*(.+)", raw)
+            name_m = re.search(r"COMPONENT_NAME:\s*(.+)", raw)
+            ext_m  = re.search(r"EXTENSION_NOTES:\s*(.+)", raw)
             return {
                 "reuse": reuse,
                 "component_name": name_m.group(1).strip() if name_m else "",
                 "extension_notes": ext_m.group(1).strip() if ext_m else "",
             }
-        except Exception:
+        except (ValueError, KeyError, AttributeError, TypeError):
             return {"reuse": False}
 
     def _design_for_task(self, title: str, desc: str, ac: list[str],
@@ -172,7 +174,7 @@ Build concise design spec for 1 task (≤ 40 lines):
 PRD (summary):
 {prd[:1500]}"""
         question = self._call(
-            f"You is {self.ROLE}. Ask a concise question (max 80 words) to BA about unclear UX requirements.",
+            f"You are {self.ROLE}. Ask a concise question (max 80 words) to BA about unclear UX requirements.",
             question_prompt,
         )
         return self.ask(ba_agent, question)
@@ -190,7 +192,7 @@ PRD (summary):
 === PROJECT PLAN ===
 {project_plan[:1500]}...{clarification_block}
 
-Build detailed design specs including design system, wireframes for key screens, and component specifications. Focus on top-priority screens/features in Sprint 1."""
+Build detailed design specs including design system, wireframes for key screens, and component specifications. Focus on top-priority screens/features in sprint 1."""
         return self._call(self.system_prompt, prompt)
 
     # 3 chiều thực sự đo is from ảnh tĩnh
@@ -248,18 +250,17 @@ VERDICT: [PASS if weighted score ≥ {self._UI_PASS_THRESHOLD} | REVISE if < {se
 Weights: Fidelity=35% Completeness=35% Heuristics=30%
 
 ISSUES:
-- [FIDELITY] vấn đề cụ can with bằng chứng (e.g.: "button primary use #2196F3 nhưng specs is #1976D2")
-- [COMPLETENESS] vấn đề cụ can (e.g.: "màn hình danh sách thiếu empty state")
-- [HEURISTICS] vấn đề cụ can (e.g.: "3 button styles other nhau in cùng màn hình")
+- [FIDELITY] vấn đề cụ thể with bằng chứng (e.g.: "button primary use #2196F3 nhưng specs is #1976D2")
+- [COMPLETENESS] vấn đề cụ thể (e.g.: "màn hình danh sách thiếu empty state")
+- [HEURISTICS] vấn đề cụ thể (e.g.: "3 button styles other nhau in cùng màn hình")
 
 REVISION_GUIDE:
-- [fix cụ can, actionable — enough to do ngay in Stitch]"""
+- [fix cụ thể, actionable — enough to do ngay in Stitch]"""
 
         raw = self._call_with_image(system, prompt, screenshot_path)
         return self._parse_review(raw)
 
     def _parse_review(self, raw: str) -> dict:
-        import re
 
         def _score(pattern: str) -> int:
             m = re.search(pattern, raw)
@@ -302,9 +303,9 @@ REVISION_GUIDE:
     def build_stitch_prompt(self, design_specs: str) -> str:
         """Distill design specs into a concise Stitch prompt (≤500 words)."""
         system = (
-            "You is UI/UX Designer. Tóm tắt design specs thành a prompt concise "
-            "for Stitch AI to generate UI. Max 300 from. "
-            "Bao gồm: name app, màu chính, font, layout chính, components important nhất."
+            "You are UI/UX Designer. Summarize design specs into a concise prompt "
+            "for Stitch AI to generate UI. Max 300 words. "
+            "Include: app name, primary colors, font, main layout, most important components."
         )
         return self._call(system, design_specs[:3000])
 
@@ -320,33 +321,33 @@ REVISION_GUIDE:
         from testing.stitch_browser import generate_and_screenshot
 
         stitch_prompt = self.build_stitch_prompt(design_specs)
-        print(f"\n  🤖 Stitch prompt generated ({len(stitch_prompt)} chars)")
+        tprint(f"\n  🤖 Stitch prompt generated ({len(stitch_prompt)} chars)")
 
         for round_num in range(1, max_rounds + 1):
-            print(f"\n  {'─'*60}")
-            print(f"  🌐 STITCH ROUND {round_num}/{max_rounds}")
-            print(f"  {'─'*60}")
+            tprint(f"\n  {'─'*60}")
+            tprint(f"  🌐 STITCH ROUND {round_num}/{max_rounds}")
+            tprint(f"  {'─'*60}")
 
             screenshot_path = generate_and_screenshot(stitch_prompt, session_id, round_num)
             review = self.review_stitch_output(screenshot_path, design_specs)
             self.print_stitch_review(review, round_num)
 
             if review["verdict"] == "PASS":
-                print(f"\n  ✅ UI đồng bộ design system! Screenshot: {screenshot_path}")
+                tprint(f"\n  ✅ UI đồng bộ design system! Screenshot: {screenshot_path}")
                 return screenshot_path
 
             if round_num < max_rounds:
                 # Refine prompt based on issues
                 refine_system = (
-                    "You is UI/UX Designer. Cải tcurrent Stitch prompt dựa trên các issues after. "
-                    "Chỉ trả về prompt  fix, no giải thích."
+                    "You are UI/UX Designer. Improve the current Stitch prompt based on the issues below. "
+                    "Return only the fixed prompt, no explanation."
                 )
                 issues_text = "\n".join(f"- {i}" for i in review["issues"])
                 refine_input = f"Prompt gốc:\n{stitch_prompt}\n\nIssues need fix:\n{issues_text}"
                 stitch_prompt = self._call(refine_system, refine_input)
-                print(f"\n  🔄 Prompt refined, try again...")
+                tprint(f"\n  🔄 Prompt refined, try again...")
 
-        print(f"\n  ⚠️  Done {max_rounds} rounds — use screenshot cuối cùng.")
+        tprint(f"\n  ⚠️  Done {max_rounds} rounds — use screenshot cuối cùng.")
         return screenshot_path
 
     @staticmethod
@@ -356,32 +357,30 @@ REVISION_GUIDE:
 
     def print_stitch_review(self, review: dict, round_num: int):
         icon = "✅" if review["verdict"] == "PASS" else "🔄"
-        print(f"\n  {'─'*62}")
-        print(f"  🎨 UI REVIEW [Round {round_num}]  {icon} {review['verdict']}  (pass≥{self._UI_PASS_THRESHOLD})")
-        print(f"  {'─'*62}")
+        tprint(f"\n  {'─'*62}")
+        tprint(f"  🎨 UI REVIEW [Round {round_num}]  {icon} {review['verdict']}  (pass≥{self._UI_PASS_THRESHOLD})")
+        tprint(f"  {'─'*62}")
 
         dims = [
             ("Fidelity     ", "score_fidelity"),
             ("Completeness ", "score_completeness"),
-            ("Accessibility", "score_accessibility"),
             ("Heuristics   ", "score_heuristics"),
-            ("User Flow    ", "score_flow"),
         ]
         for label, key in dims:
             s = review.get(key, review["score"])
             warn = "  ⚠" if s < 7 else ""
-            print(f"  {label}  {self._bar(s)}  {s:2}/10{warn}")
+            tprint(f"  {label}  {self._bar(s)}  {s:2}/10{warn}")
 
-        print(f"  {'·'*62}")
-        print(f"  Final        {self._bar(review['score'])}  {review['score']:2}/10")
-        print(f"  {'─'*62}")
+        tprint(f"  {'·'*62}")
+        tprint(f"  Final        {self._bar(review['score'])}  {review['score']:2}/10")
+        tprint(f"  {'─'*62}")
 
         if review["issues"]:
-            print("  ⚠️  Issues:")
+            tprint("  ⚠️  Issues:")
             for i in review["issues"][:6]:
-                print(f"     • {i}")
+                tprint(f"     • {i}")
         if review["verdict"] == "REVISE" and review["revision_guide"]:
-            print("  📝 Sửa in Stitch:")
+            tprint("  📝 Sửa in Stitch:")
             for g in review["revision_guide"][:4]:
-                print(f"     → {g}")
-        print(f"  {'─'*62}")
+                tprint(f"     → {g}")
+        tprint(f"  {'─'*62}")

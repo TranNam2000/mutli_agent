@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from core.logging import tprint
 from .base_agent import BaseAgent
 
 
@@ -29,22 +30,14 @@ ALL_KINDS = (
     KIND_FEATURE, KIND_BUG_FIX, KIND_UI_TWEAK, KIND_REFACTOR, KIND_INVESTIGATION,
 )
 
-# Sub-pipeline per kind. Step keys match orchestrator.STEP_KEYS.
-DISPATCH_PLAN: dict[str, list[str]] = {
-    # BA is INCLUDED only for `feature` (where real requirement analysis is
-    # the value-add). For the lean kinds it is optional — the orchestrator
-    # synthesises a placeholder Task from the raw request so downstream
-    # Dev/Test still have structured input without spending BA tokens.
-    KIND_FEATURE:       ["ba", "design", "techlead", "test_plan", "dev", "test"],
-    KIND_BUG_FIX:       ["dev", "test"],
-    KIND_UI_TWEAK:      ["design", "dev", "test"],
-    KIND_REFACTOR:      ["techlead", "dev", "test"],
-    KIND_INVESTIGATION: ["investigation"],
-}
+# All recognised pipeline step keys (matches orchestrator.STEP_KEYS minus PM).
+# Used as a final safety fallback when both the LLM step picker and the
+# heuristic give nothing — the runner just executes everything in order.
+ALL_STEPS: list[str] = ["ba", "design", "techlead", "test_plan", "dev", "test"]
 
-# Kinds for which BA can be re-added if user passes --with-ba or per-profile
-# override. (Hook for future extension; not wired to CLI yet.)
-BA_OPTIONAL_KINDS = (KIND_BUG_FIX, KIND_UI_TWEAK, KIND_REFACTOR)
+# Investigation has its own single step (no Dev/Test) and is recognised by
+# kind directly in run_investigation_path — kept here for clarity.
+INVESTIGATION_STEPS: list[str] = ["investigation"]
 
 # Heuristic keywords — used before hitting the LLM. Keywords are matched
 # against the lowercased, diacritic-stripped request, so Vietnamese variants
@@ -71,7 +64,14 @@ _KEYWORDS: dict[str, list[str]] = {
         "how does", "how do", "why is", "why does", "what is", "can we",
         "is it possible", "explain", "audit", "analyze", "analyse", "compare",
         "feasibility", "research", "investigate",
+        # documentation / spec review
+        "review doc", "review docs", "review documentation", "check doc",
+        "check docs", "verify spec", "verify docs", "inspect doc",
+        # vietnamese variants
         "tai sao", "nhu the nao", "co the", "giai thich", "tim hieu", "khao sat",
+        "kiem tra tai lieu", "kiem tra spec", "kiem tra doc",
+        "ra soat", "ra soat tai lieu", "danh gia tai lieu",
+        "doc tai lieu", "xem tai lieu", "phan tich tai lieu",
     ],
     KIND_FEATURE: [
         # English triggers — "add <something>", "build <something>", etc.
@@ -115,7 +115,12 @@ class RouteDecision:
     def dispatch_steps(self) -> list[str]:
         if self.dynamic_steps:
             return list(self.dynamic_steps)
-        return list(DISPATCH_PLAN.get(self.kind, DISPATCH_PLAN[KIND_FEATURE]))
+        # Investigation has its own minimal flow; everything else falls back
+        # to the full step set so nothing important gets silently skipped
+        # when PM didn't emit dynamic_steps for any reason.
+        if self.kind == KIND_INVESTIGATION:
+            return list(INVESTIGATION_STEPS)
+        return list(ALL_STEPS)
 
     def to_markdown(self) -> str:
         lines = [
@@ -146,6 +151,10 @@ class PMAgent(BaseAgent):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    # Kinds whose dispatch plan rarely needs LLM tuning — heuristic + default
+    # plan is good enough. When a keyword match is unambiguous (confidence
+    # ≥ 0.85) for one of these kinds, we skip `_llm_decide_steps` entirely
+    # and save ~800 tokens / task.
     def classify(self, request: str) -> RouteDecision:
         """Return a RouteDecision. Tries heuristic first, falls back to LLM."""
         heur = self._heuristic(request)
@@ -163,47 +172,107 @@ class PMAgent(BaseAgent):
             else:
                 decision = llm
 
-        # Let PM dynamically decide which steps are actually needed
-        decision.dynamic_steps = self._llm_decide_steps(request, decision.kind)
+        # Investigation has a fixed single-step flow — no need to ask the
+        # LLM. Everything else first tries to read STEPS from whichever PM
+        # routing skill the LLM self-picked during classify() (the MODE:
+        # tag in the LLM reply was parsed by _record_mode_from_output and
+        # populated `_active_skills`). If the picked skill declares STEPS
+        # in its frontmatter, we use that — this skips an LLM round-trip.
+        # Falls through to _llm_decide_steps (LLM picks per-task) only for
+        # the `default` skill or when no skill matched.
+        if decision.kind == KIND_INVESTIGATION:
+            decision.dynamic_steps = list(INVESTIGATION_STEPS)
+        else:
+            skill_steps = self._steps_from_active_skill()
+            if skill_steps:
+                decision.dynamic_steps = skill_steps
+                tprint(f"  📋 [PM] steps from skill `{self._active_skills[0]['skill_key']}` → "
+                       f"{', '.join(skill_steps)}")
+            else:
+                decision.dynamic_steps = self._llm_decide_steps(request, decision.kind)
         return decision
 
-    def _llm_decide_steps(self, request: str, kind: str) -> list[str]:
-        """Ask PM to decide which pipeline steps are needed for this specific task."""
-        all_steps = ["ba", "design", "techlead", "test_plan", "dev", "test"]
-        default = DISPATCH_PLAN.get(kind, DISPATCH_PLAN[KIND_FEATURE])
-        prompt = f"""You are a Project Manager deciding which pipeline steps to run for this task.
+    def _steps_from_active_skill(self) -> list[str]:
+        """Return STEPS declared by the active PM routing skill, or [] if
+        either no skill is active or the active skill doesn't declare STEPS
+        (e.g. the `default` skill defers to the LLM step picker)."""
+        if not self._active_skills:
+            return []
+        steps = self._active_skills[0].get("steps") or []
+        # Validate: every entry must be a known step key.
+        return [s for s in steps if s in ALL_STEPS]
 
-Available steps:
-- ba: Requirements analysis — needed when task has complex business rules or unclear scope
-- design: UI/UX design — needed when task has screen/UI components
-- techlead: Architecture decisions — needed when task requires new modules, APIs, or complex logic
-- test_plan: Test planning — needed when task is complex or high-risk
-- dev: Implementation — almost always needed
-- test: QA review — almost always needed
+    def _llm_decide_steps(self, request: str, kind: str) -> list[str]:
+        """Ask PM (LLM) to reason about which pipeline steps the task
+        actually needs. The LLM must distinguish:
+
+          • **Code-producing** tasks → include `dev` + `test`
+          • **Doc-only / spec-only** tasks → include `ba` (writes docs)
+            and possibly `techlead` (writes architecture docs); SKIP
+            `dev` + `test`
+          • **Discovery / research** tasks → already routed to
+            investigation kind; not handled here
+          • **UI tweak only** → may skip `ba` and `techlead`
+
+        We trust the LLM's judgement — there is no keyword fallback.
+        On parse failure we pick the conservative full set, so a
+        partially-broken LLM call doesn't accidentally drop QA.
+        """
+        prompt = f"""You are a Project Manager. Choose the MINIMUM set of pipeline steps needed for this specific task.
+
+Available steps (run in this order if selected):
+- ba: Requirements analysis — writes `docs/requirements/<feature>.md` + task list
+- design: UI/UX design — writes design specs, screens, design system updates
+- techlead: Architecture decisions — writes `docs/arch/<feature>.md`, sprint plan
+- test_plan: Test planning — writes test scenarios + acceptance criteria
+- dev: Implementation — writes/edits source code
+- test: QA review — runs/writes test code
+
+CRITICAL routing rules:
+1. If the task is to **write/build/update/review documentation** (e.g. "viết tài liệu OAuth", "build API doc", "spec cho module X") → STEPS: ba   (and `techlead` only if architecture-level doc)
+   ❌ Do NOT include `dev` or `test` — there is no code to write.
+2. If the task is to **fix a bug** → STEPS: dev, test
+3. If the task is **UI tweak only** (color/copy/spacing) → STEPS: design, dev, test
+4. If the task is a **new feature** with code → STEPS: ba, design, techlead, test_plan, dev, test  (drop `design` if no UI)
+5. If unclear which → include `dev` to be safe, but explain in REASON.
 
 Task kind: {kind}
 Request:
 {request.strip()[:1000]}
 
-Reply with ONLY a comma-separated list of steps needed, in order. Example:
-STEPS: ba, design, techlead, dev, test
-
-Choose only what is truly necessary. Omit steps that add no value for this task."""
+Reply EXACTLY in this format (one line):
+STEPS: <comma-separated>
+REASON: <one short sentence why dev/test are or aren't included>"""
 
         try:
             raw = self._call(self.system_prompt, prompt)
             m = re.search(r"STEPS:\s*([a-z_,\s]+)", raw, re.IGNORECASE)
             if m:
-                steps = [s.strip() for s in m.group(1).split(",") if s.strip() in all_steps]
-                if steps and "dev" in steps:
+                steps = [s.strip() for s in m.group(1).split(",")
+                         if s.strip() in ALL_STEPS]
+                if steps:
+                    # Print the LLM's REASON so the user sees why steps were
+                    # picked — especially important when `dev` is omitted.
+                    rmatch = re.search(r"REASON:\s*(.+?)(?:\n|$)", raw, re.IGNORECASE)
+                    reason = rmatch.group(1).strip() if rmatch else ""
+                    if "dev" not in steps:
+                        tprint(f"  ⚠️  [PM] no `dev` step. Reason: {reason or '(none)'}")
+                    elif reason:
+                        tprint(f"  ℹ️  [PM] steps reason: {reason}")
                     return steps
         except Exception as e:
-            print(f"  ⚠️  [PM] dynamic steps failed: {e}")
-        return list(default)
+            tprint(f"  ⚠️  [PM] dynamic steps failed: {e}")
+        # Conservative fallback only if LLM call totally broke (timeout,
+        # malformed reply). Better to run an extra step than silently
+        # drop QA on a real code change.
+        return list(ALL_STEPS)
 
     def dispatch_plan(self, kind: str) -> list[str]:
-        """Expose DISPATCH_PLAN for the orchestrator."""
-        return list(DISPATCH_PLAN.get(kind, DISPATCH_PLAN[KIND_FEATURE]))
+        """Default dispatch plan for a kind. Kept for back-compat callers
+        — internal code now routes through `_llm_decide_steps`."""
+        if kind == KIND_INVESTIGATION:
+            return list(INVESTIGATION_STEPS)
+        return list(ALL_STEPS)
 
     # ── Heuristic layer ───────────────────────────────────────────────────────
 
@@ -258,7 +327,7 @@ Choose only what is truly necessary. Omit steps that add no value for this task.
         try:
             raw = self._call(self.system_prompt, prompt)
         except Exception as e:
-            print(f"  ⚠️  [PM] LLM classify failed: {e}")
+            tprint(f"  ⚠️  [PM] LLM classify failed: {e}")
             return None
 
         decision = self._parse_output(raw)

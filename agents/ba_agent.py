@@ -1,6 +1,7 @@
 """BA (Business Analyst) Agent - Requirements gathering and analysis."""
 from __future__ import annotations
 import re
+from core.logging import tprint
 from .base_agent import BaseAgent
 
 
@@ -33,8 +34,8 @@ If ambiguous → list 3-5 specific questions for the stakeholder:
 CLEAR: NO
 QUESTIONS:
 1. [specific question — not generic]
-2. [question cụ can]
-3. [question cụ can]"""
+2. [question cụ thể]
+3. [question cụ thể]"""
 
         raw = self._call(self.system_prompt, prompt)
 
@@ -97,11 +98,11 @@ REQUIRED format:
 AFFECTED: [comma-separated list | NONE]
 UNCHANGED: [comma-separated list | NONE]
 REASON_ba: [short reason | N/A]
-REASON_pm: [lý do | N/A]
-REASON_design: [lý do | N/A]
-REASON_techlead: [lý do | N/A]
-REASON_dev: [lý do | N/A]
-REASON_test: [lý do | N/A]
+REASON_pm: [short reason | N/A]
+REASON_design: [short reason | N/A]
+REASON_techlead: [short reason | N/A]
+REASON_dev: [short reason | N/A]
+REASON_test: [short reason | N/A]
 SUMMARY: [1-2 sentence summarizing change scope]"""
 
         raw = self._call(self.system_prompt, prompt)
@@ -172,14 +173,14 @@ SUMMARY: [1-2 sentence summarizing change scope]"""
         affected  = set(assessment["affected"])
         unchanged = set(assessment["unchanged"])
 
-        print(f"\n  {'═'*60}")
-        print(f"  🎯 IMPACT ASSESSMENT")
-        print(f"  {'═'*60}")
+        tprint(f"\n  {'═'*60}")
+        tprint(f"  🎯 IMPACT ASSESSMENT")
+        tprint(f"  {'═'*60}")
         if assessment["summary"]:
-            print(f"  {assessment['summary']}")
+            tprint(f"  {assessment['summary']}")
 
         # ASCII pipeline diagram
-        print(f"\n  Pipeline:")
+        tprint(f"\n  Pipeline:")
         nodes = []
         for step in self._PIPELINE_STEPS:
             if step in affected:
@@ -190,18 +191,18 @@ SUMMARY: [1-2 sentence summarizing change scope]"""
                 nodes.append(f"[··{step}]")
         # Design + TechLead are parallel
         ba, pm, design, tl, dev, test = nodes
-        print(f"  {ba} ──► {pm} ──► {design} ┐")
-        print(f"  {'':>{len(ba)+7}}{tl} ┘──► {dev} ──► {test}")
+        tprint(f"  {ba} ──► {pm} ──► {design} ┐")
+        tprint(f"  {'':>{len(ba)+7}}{tl} ┘──► {dev} ──► {test}")
 
         # Legend + reasons
-        print(f"\n  🔄 Needs update : {', '.join(sorted(affected))  or 'none'}")
-        print(f"  ✅ Unchanged   : {', '.join(sorted(unchanged)) or 'none'}")
+        tprint(f"\n  🔄 Needs update : {', '.join(sorted(affected))  or 'none'}")
+        tprint(f"  ✅ Unchanged   : {', '.join(sorted(unchanged)) or 'none'}")
         for step in self._PIPELINE_STEPS:
             if step in affected:
                 r = assessment["reasons"].get(step, "")
                 if r and r.upper() != "N/A":
-                    print(f"    → [{step:8}] {r}")
-        print(f"  {'═'*60}")
+                    tprint(f"    → [{step:8}] {r}")
+        tprint(f"  {'═'*60}")
 
     # ── Feedback Assessment ───────────────────────────────────────────────────
 
@@ -226,7 +227,7 @@ SUMMARY: [1-2 sentence summarizing change scope]"""
 FEEDBACK TYPE: {feedback_type}
 DESCRIPTION: {feedback_task[:800]}
 
-=== TÀI LIỆU HIỆN CÓ ===
+=== EXISTING DOCS ===
 {doc_summary}
 
 Based on feedback type "{feedback_type}", identify which steps need updating.
@@ -235,16 +236,16 @@ Initial suggestion: {', '.join(default_affected)} — but adjust based on docs i
 Steps: ba | pm | design | techlead | dev | test_plan | test_review
 
 REQUIRED format:
-AFFECTED: [danh sách | NONE]
-UNCHANGED: [danh sách | NONE]
-REASON_ba: [lý do | N/A]
-REASON_pm: [lý do | N/A]
-REASON_design: [lý do | N/A]
-REASON_techlead: [lý do | N/A]
-REASON_dev: [lý do | N/A]
-REASON_test_plan: [lý do | N/A]
-REASON_test_review: [lý do | N/A]
-SUMMARY: [1-2 câu describe change scope]"""
+AFFECTED: [comma-separated list | NONE]
+UNCHANGED: [comma-separated list | NONE]
+REASON_ba: [short reason | N/A]
+REASON_pm: [short reason | N/A]
+REASON_design: [short reason | N/A]
+REASON_techlead: [short reason | N/A]
+REASON_dev: [short reason | N/A]
+REASON_test_plan: [short reason | N/A]
+REASON_test_review: [short reason | N/A]
+SUMMARY: [1-2 sentences describing change scope]"""
 
         raw = self._call(self.system_prompt, prompt)
         result = self._parse_impact(raw)
@@ -276,14 +277,14 @@ Lưu ý:
         Uses the `task_based` skill explicitly (overrides auto-detect)."""
         # Force the task_based skill
         try:
-            from learning.skill_selector import list_skills
+            from pipeline.skill_selector import list_skills
             for skill in list_skills("ba"):
                 if skill["skill_key"] == "task_based":
                     self._active_skill = skill
                     self._active_skill["detected_scope"] = "feature"
                     self._active_skill["selection_method"] = "forced"
                     break
-        except Exception:
+        except (ValueError, KeyError, AttributeError, TypeError):
             pass
 
         prompt = f"""Stakeholder task / request:
@@ -337,14 +338,13 @@ Metadata rules:
             return tasks_markdown
 
         # Simple line-level injection: find TASK-XXX header, add design ref after **Title:**
-        import re as _re
         updated: list[str] = []
         lines = tasks_markdown.splitlines()
         i = 0
         current_id: str | None = None
         while i < len(lines):
             line = lines[i]
-            m = _re.match(r"^##\s+(TASK-\w+)\s*\|", line)
+            m = re.match(r"^##\s+(TASK-\w+)\s*\|", line)
             if m:
                 current_id = m.group(1)
             updated.append(line)

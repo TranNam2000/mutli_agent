@@ -10,6 +10,15 @@ Hardened for production use:
   * Session validity ping before the main call — auto re-login when expired
   * Transient vs permanent error classification
 
+NOTE on `except Exception:` handlers: this module intentionally uses broad
+catches around Playwright operations. Playwright raises a deep hierarchy
+(TimeoutError, TargetClosedError, ElementHandleError, …) and a narrow
+tuple would either be brittle to version bumps or would miss a new sibling
+class. The retry-with-backoff machinery at the call site handles the
+result uniformly. If you see `except Exception:` in this file, that's why;
+please don't replace it with `except (OSError, …):` — you'll break the
+browser resilience layer.
+
 First-time setup:
     python stitch_browser.py --login
 
@@ -434,7 +443,7 @@ def _vision_detect_input(page):
         "Here is a screenshot of Stitch (stitch.withgoogle.com). "
         "Find the text input field where the user types their UI prompt. "
         "Reply with the centre coordinates in this exact format: X=<int> Y=<int>. "
-        "If no input field is visible, reply: NOT_FOUND"
+        "nếu không input field is visible, reply: NOT_FOUND"
     )
     try:
         result = subprocess.run(

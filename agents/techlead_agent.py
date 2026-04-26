@@ -1,5 +1,6 @@
 """Tech Lead Agent - Architecture decisions and technical guidance."""
 from __future__ import annotations
+import re
 from .base_agent import BaseAgent
 
 
@@ -171,7 +172,7 @@ class TechLeadAgent(BaseAgent):
                 break
         try:
             m = task.get_metadata() if hasattr(task, "get_metadata") else None
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             m = None
         if m is not None:
             if m.touches_core() and m.context.complexity in ("L", "XL"):
@@ -206,8 +207,7 @@ class TechLeadAgent(BaseAgent):
         for trigger, tokens in _COHESION_LIBS.items():
             # Word-boundary match to avoid "firebase" matching "firebaseauth"
             # but still match "firebase" in "use firebase for auth".
-            import re as _re
-            if not _re.search(rf"\b{_re.escape(trigger)}\b", hay_task):
+            if not re.search(rf"\b{re.escape(trigger)}\b", hay_task):
                 continue
             # If ANY expected token is present in project context → OK.
             if any(tok.lower() in hay_ctx for tok in tokens):
@@ -241,10 +241,9 @@ class TechLeadAgent(BaseAgent):
     @staticmethod
     def _apply_ba_clarifications(tasks: list, answer: str) -> int:
         """Parse BA answer, append new AC / edge-case lines to matching tasks."""
-        import re as _re
-        pattern = _re.compile(
+        pattern = re.compile(
             r"CLARIFY\s+(TASK-[\w\-]+)\s*:\s*(.+?)(?=\n\s*CLARIFY\s+TASK-|\Z)",
-            _re.DOTALL | _re.IGNORECASE,
+            re.DOTALL | re.IGNORECASE,
         )
         patched = 0
         for m in pattern.finditer(answer):
@@ -286,7 +285,7 @@ class TechLeadAgent(BaseAgent):
 
         Returns {sprint_plan, adjustments, resources, summary_markdown}.
         """
-        from learning.task_models import plan_sprints, Resources, format_task_list
+        from pipeline.task_models import plan_sprints, Resources, format_task_list
 
         res = Resources(
             dev_slots=     (resources or {}).get("dev_slots",     2),
@@ -326,7 +325,7 @@ class TechLeadAgent(BaseAgent):
             for t in tasks[:20]
         )
         system = (
-            "You is Tech Lead review task list from BA. Evaluate complexity/risk "
+            "You are Tech Lead reviewing task list from BA. Evaluate complexity/risk "
             "look reasonable. Reply briefly — max 5 adjustments."
         )
         prompt = f"""Tasks from BA:
@@ -339,19 +338,18 @@ ADJUST: TASK-XXX risk low→high — lý do
 If all OK: NONE"""
         try:
             raw = self._call(system, prompt)
-        except Exception:
+        except (ValueError, KeyError, AttributeError, TypeError):
             return []
         if "NONE" in raw.upper():
             return []
 
         adjustments = []
-        import re as _re
         for line in raw.splitlines():
             s = line.strip()
             if not s.startswith("ADJUST:"):
                 continue
             adjustments.append(s[7:].strip())
-            m = _re.match(
+            m = re.match(
                 r"(TASK-\w+)\s+(complexity|risk)\s+(\w+)\s*(?:→|->|>|-)+\s*(\w+)",
                 s[7:].strip(),
             )
@@ -362,10 +360,10 @@ If all OK: NONE"""
                         continue
                     try:
                         if field == "complexity":
-                            from learning.task_models import Complexity
+                            from pipeline.task_models import Complexity
                             t.complexity = Complexity(new.upper())
                         elif field == "risk":
-                            from learning.task_models import Risk
+                            from pipeline.task_models import Risk
                             t.risk = Risk(new.lower())
                     except ValueError:
                         pass
@@ -379,7 +377,7 @@ Each task: file name, layer (entity/repo/bloc/ui), short description, estimate (
 Architecture (summary):
 {tech_specs[:2000]}"""
         task_list = self._call(
-            f"You is {self.ROLE}. Build a concise, actionable dev task breakdown — max 200 words.",
+            f"You are {self.ROLE}. Build a concise, actionable dev task breakdown — max 200 words.",
             task_prompt,
         )
         return self.ask(dev_agent, task_list)
@@ -400,7 +398,7 @@ FIX_TASKS:
 - [specific file/layer] [action needed]
 PRIORITY: [fix order]"""
         fix_tasks = self._call(
-            f"You is {self.ROLE}. Triage bugs from QA, assign concrete fix tasks to Dev — max 150 words.",
+            f"You are {self.ROLE}. Triage bugs from QA, assign concrete fix tasks to Dev — max 150 words.",
             triage_prompt,
         )
         return self.ask(dev_agent, fix_tasks)
@@ -416,7 +414,7 @@ PRIORITY: [fix order]"""
 {implementation[:3000]}
 
 Answer concisely (max 200 words):
-APPROVED: [YES | NO — if NO must fix before QA]
+APPROVED: [YES | NO — nếu không must fix before QA]
 ISSUES:
 - [specific issue if any: wrong layer, wrong pattern, security hole, missing error handling]
 FEEDBACK_FOR_DEV:

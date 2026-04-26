@@ -107,7 +107,6 @@ def run_checks() -> list[CheckResult]:
 
     # Playwright (only for Stitch UI generator)
     try:
-        import playwright  # noqa: F401
         results.append(CheckResult("python:playwright", True, version="(imported)",
                                     critical=False))
     except ImportError:

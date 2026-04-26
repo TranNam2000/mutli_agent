@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from datetime import datetime
 from pathlib import Path
+from core.logging import tprint
 from .base_agent import BaseAgent, _RULES_DIR
 
 
@@ -60,8 +61,8 @@ class RuleOptimizerAgent(BaseAgent):
 === CONTEXT ĐẦY ĐỦ TỪNG AGENT ===
 {rule_context}
 
-Đề xuất cải tcurrent dựa trên context thực tế ở trên.
-With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_CHECK → chỉ viết ADDITION if SAFE."""
+Đề xuất cải thiện dựa trên context thực tế ở trên.
+With mỗi đề xuất: đọc rule hiện tại → tự kiểm tra CONFLICT_CHECK → chỉ viết ADDITION if SAFE."""
 
         raw = self._call(self.system_prompt, prompt)
         return self._parse_suggestions(raw, profile)
@@ -84,7 +85,7 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
             from learning.integrity_rules import (
                 MODULE_BLACKLIST_THRESHOLD, REPUTATION_FN_THRESHOLD,
             )
-        except Exception:
+        except (ImportError, ValueError, KeyError, AttributeError):
             MODULE_BLACKLIST_THRESHOLD = 3
             REPUTATION_FN_THRESHOLD = 2
 
@@ -193,12 +194,12 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
             # Current rule file
             rule_content, _ = _load_rule(key, "rule", profile)
             if rule_content:
-                lines.append(f"**Rule current tại:**\n{rule_content}")
+                lines.append(f"**Rule hiện tại:**\n{rule_content}")
 
             # Current criteria file
             crit_content, _ = _load_rule(key, "criteria", profile)
             if crit_content:
-                lines.append(f"**Criteria current tại:**\n{crit_content}")
+                lines.append(f"**Criteria hiện tại:**\n{crit_content}")
 
             # PASS patterns (protect these)
             if history:
@@ -214,7 +215,7 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
                 ]
                 if applied:
                     ap_lines = "\n".join(f"  • {e['reason_sample'][:80]}" for e in applied[:3])
-                    lines.append(f"**Done apply before đó (KHÔNG lặp again):**\n{ap_lines}")
+                    lines.append(f"**Done apply before đó (KHÔNG lặp lại):**\n{ap_lines}")
 
             parts.append("\n".join(lines))
 
@@ -248,7 +249,7 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
         lines = ["=== CHECKLIST ITEMS QUÁ DỄ (YES 100% — need siết chặt hơn) ==="]
         for ei in easy_items:
             lines.append(f"• [{ei['agent_key'].upper()} / criteria] ({ei['total_count']}x YES) {ei['sample']}")
-        lines.append("→ Đề xuất ACTION=REPLACE to viết again item cụ can and khó hơn.")
+        lines.append("→ Đề xuất ACTION=REPLACE để viết lại item cụ thể và khó hơn.")
         return "\n".join(lines)
 
     def _format_chronic(self, chronic_patterns: list[dict] | None) -> str:
@@ -383,7 +384,7 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
     def rollback(self, backup_path: str, rule_path: Path) -> bool:
         src = Path(backup_path)
         if not src.exists():
-            print(f"  ❌ Backup no tồn tại: {backup_path}")
+            tprint(f"  ❌ Backup không tồn tại: {backup_path}")
             return False
         shutil.copy(src, rule_path)
         return True
@@ -392,12 +393,12 @@ With mỗi đề xuất: đọc rule current tại → tự kiểm tra CONFLICT_
         icon  = "📋" if s["target_type"] == "criteria" else "📜"
         label = "CRITERIA" if s["target_type"] == "criteria" else "RULE"
         action_label = f"[{s.get('action','ADD')}]"
-        print(f"\n  {'─'*60}")
-        print(f"  🧠 {label} {action_label} — {s['agent_key'].upper()}  {icon}")
-        print(f"  {'─'*60}")
-        print(f"  File   : rules/{s['profile']}/{'criteria/' if s['target_type'] == 'criteria' else ''}{s['agent_key']}.md")
-        print(f"  Reason : {s['reason']}")
-        print(f"  Thêm:")
+        tprint(f"\n  {'─'*60}")
+        tprint(f"  🧠 {label} {action_label} — {s['agent_key'].upper()}  {icon}")
+        tprint(f"  {'─'*60}")
+        tprint(f"  File   : rules/{s['profile']}/{'criteria/' if s['target_type'] == 'criteria' else ''}{s['agent_key']}.md")
+        tprint(f"  Reason : {s['reason']}")
+        tprint(f"  Thêm:")
         for line in s["addition"].splitlines():
-            print(f"    + {line}")
-        print(f"  {'─'*60}")
+            tprint(f"    + {line}")
+        tprint(f"  {'─'*60}")

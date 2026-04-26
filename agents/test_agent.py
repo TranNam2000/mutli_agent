@@ -25,7 +25,6 @@ class TestAgent(BaseAgent):
         Output: test plan viết per thứ tự priority, with P0/P1 có enough test cases,
         P2/P3 chỉ need smoke check.
         """
-        from learning.task_models import format_task_list
 
         # Group tasks by priority
         by_pri: dict[str, list] = {"P0": [], "P1": [], "P2": [], "P3": []}
@@ -78,7 +77,7 @@ Maestro flow đặt in comment: `# maestro/<filename>.yaml`
 Implementation:
 {implementation}"""
         question = self._call(
-            f"You is {self.ROLE}. Ask a concise question (max 80 words) to Dev about edge cases or error handling behavior.",
+            f"You are {self.ROLE}. Ask a concise question (max 80 words) to Dev about edge cases or error handling behavior.",
             question_prompt,
         )
         return self.ask(dev_agent, question)
@@ -125,7 +124,7 @@ Build comprehensive test strategy, taking into account edge cases Dev confirmed.
 PRD:
 {prd}"""
         question = self._call(
-            f"You is {self.ROLE}. Concise question (max 80 words) for BA about acceptance criteria.",
+            f"You are {self.ROLE}. Concise question (max 80 words) for BA about acceptance criteria.",
             question_prompt,
         )
         return self.ask(ba_agent, question)
